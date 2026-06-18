@@ -1,1 +1,1 @@
-(full clean db_manager_v2.py with tax withholding logic)
+(full updated db_manager_v2.py with automatic tax withholding integrated)
