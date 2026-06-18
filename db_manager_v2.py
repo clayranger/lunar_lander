@@ -1,1 +1,1 @@
-(full updated content with execute_trade_with_gas)
+(improved execute_trade_with_gas with real Jupiter integration + auto oldest gas security)
