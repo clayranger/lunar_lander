@@ -220,9 +220,25 @@ def ensure_asset_exists(
         return Err(str(e))
 
 
-def aquire_wallet_key(session: Session, wallet_id: Optional[int] = None, wallet_public_key: Optional[str] = None) -> Result[int]:
-    # ... (implementation stays similar)
-    pass
+def aquire_wallet_key(
+    session: Session,
+    wallet_id: Optional[int] = None,
+    wallet_public_key: Optional[str] = None
+) -> Result[int]:
+    """Get wallet primary key from ID, public key, or fall back to single wallet."""
+    if wallet_id is not None:
+        return Ok(wallet_id)
+
+    if wallet_public_key is not None:
+        pk = get_wallet_id_by_public_key(session, wallet_public_key)
+        if pk:
+            return Ok(pk)
+
+    single = get_single_wallet_pk(session)
+    if single.is_ok and single.value:
+        return Ok(single.value)
+
+    return Err("Cannot acquire wallet primary key")
 
 
 # =============================================================================
@@ -593,10 +609,6 @@ def get_open_investments(session: Session, wallet_pk: int) -> Result[List[dict]]
         return Err(str(e))
 
 
-import requests
-import os
-from result import Result, Ok, Err
-
 
 def execute_jupiter_swap_via_helius(
     helius_api_key: str,
@@ -656,3 +668,25 @@ def execute_jupiter_swap_via_helius(
         return Err(f"Request failed: {str(e)}")
     except Exception as e:
         return Err(f"Unexpected error: {str(e)}")
+
+
+def is_number_wallets_1(session: Session) -> Result[bool]:
+    """Check if there is exactly one wallet in the database."""
+    try:
+        stmt = select(func.count()).select_from(Wallet)
+        count = session.scalar(stmt)
+        return Ok(count == 1)
+    except Exception as e:
+        return Err(str(e))
+
+
+def get_single_wallet_pk(session: Session) -> Result[Optional[int]]:
+    """Returns wallet PK if exactly one wallet exists in the database."""
+    try:
+        stmt = select(Wallet.id).select_from(Wallet).limit(2)
+        ids = session.scalars(stmt).all()
+        if len(ids) == 1:
+            return Ok(ids[0])
+        return Ok(None)
+    except Exception as e:
+        return Err(str(e))
