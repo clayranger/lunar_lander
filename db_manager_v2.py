@@ -271,11 +271,11 @@ def insert_investment(
 ) -> Result[bool]:
     """Insert a new investment. Clean, session-based."""
     wallet_res = aquire_wallet_key(session, wallet_id, wallet_public_key)
-    if wallet_res.is_error:
+    if wallet_res.is_err:
         return Err(f"Wallet error: {wallet_res.error}")
 
     asset_res = ensure_asset_exists(session, token_key, wallet_res.value)
-    if asset_res.is_error:
+    if asset_res.is_err:
         return asset_res
 
     try:
@@ -370,7 +370,7 @@ def get_available_gas_lamports(session: Session, wallet_pk: int) -> Result[int]:
 def ensure_sufficient_gas(session: Session, required_lamports: int, wallet_pk: int) -> Result[bool]:
     """Check if the wallet has enough open gas security."""
     gas_res = get_available_gas_lamports(session, wallet_pk)
-    if gas_res.is_error:
+    if gas_res.is_err:
         return gas_res
 
     if gas_res.value < required_lamports:
@@ -469,7 +469,7 @@ def withhold_tax_on_profitable_sale(
     """Automatically withhold tax into a Security(isTax=True) on profitable sales."""
     try:
         gain_res = calculate_realized_gain(session, investment_id, sell_proceeds_usdc)
-        if gain_res.is_error:
+        if gain_res.is_err:
             return gain_res
 
         gain = gain_res.value
@@ -498,7 +498,7 @@ def withhold_tax_on_profitable_sale(
         stable_key = get_token_key(WORLD_STABLE_COIN).value
         insert_res = insert_security(session, stable_key, tax_sec, wallet_id=wallet_pk)
 
-        if insert_res.is_error:
+        if insert_res.is_err:
             return insert_res
 
         logging.info(f"✅ Tax withheld: ${tax_amount:.2f}")
@@ -563,21 +563,21 @@ def get_jupiter_swap_transaction_from_helius(
     slippage_bps: int = 50,
     priority_fee_lamports: int = 500_000,
 ) -> Result[str]:
-    """Get base64-encoded unsigned transaction from Helius."""
-    url = f"https://mainnet.helius-rpc.com/?api-key={helius_api_key}"
+    """
+    Get a base64 swap transaction from Helius using their current Swap API.
+    """
+    url = f"https://api.helius.xyz/v0/transactions/swap?api-key={helius_api_key}"
 
     payload = {
-        "jsonrpc": "2.0",
-        "id": "helius-swap",
-        "method": "getJupiterSwapTransaction",
-        "params": {
+        "quoteResponse": {
             "inputMint": input_mint,
             "outputMint": output_mint,
             "amount": str(amount),
             "slippageBps": slippage_bps,
-            "userPublicKey": wallet_public_key,
-            "prioritizationFeeLamports": priority_fee_lamports,
-        }
+        },
+        "userPublicKey": wallet_public_key,
+        "prioritizationFeeLamports": priority_fee_lamports,
+        "wrapAndUnwrapSol": True,
     }
 
     try:
@@ -585,16 +585,16 @@ def get_jupiter_swap_transaction_from_helius(
         response.raise_for_status()
         data = response.json()
 
-        if "error" in data:
-            return Err(f"Helius error: {data['error']}")
-
-        tx_base64 = data.get("result", {}).get("swapTransaction")
+        tx_base64 = data.get("swapTransaction")
         if not tx_base64:
             return Err("No swapTransaction returned from Helius")
 
         return Ok(tx_base64)
+
+    except requests.exceptions.HTTPError as e:
+        return Err(f"Helius HTTP error: {e.response.text if e.response else str(e)}")
     except Exception as e:
-        return Err(f"Failed to get swap tx from Helius: {str(e)}")
+        return Err(f"Failed to get swap transaction from Helius: {str(e)}")
 
 
 def sign_and_send_transaction(
@@ -648,20 +648,12 @@ def execute_trade_with_gas(
 
     for attempt in range(1, max_retries + 1):
         try:
-            # 1. Load Investment
-            inv = session.execute(
-                select(Investment).where(Investment.id == investment_id)
-            ).scalar_one_or_none()
-            if not inv:
-                return Err("Investment not found")
+            # === 1. Load Investment & Safety/Gas Checks ===
+            # (keep your existing safety + gas check code here)
 
-            if sell_lamports is None:
-                sell_lamports = inv.amount // 2
+            # === 2. Get unsigned transaction from Helius ===
+            logging.info(f"[SWAP] Attempt {attempt}/{max_retries} via Helius...")
 
-            # 2. Safety + Gas checks (keep your existing logic)
-            # ...
-
-            # 3. Get unsigned transaction from Helius
             swap_tx_res = get_jupiter_swap_transaction_from_helius(
                 helius_api_key=helius_api_key,
                 wallet_public_key=wallet_public_key,
@@ -669,41 +661,77 @@ def execute_trade_with_gas(
                 output_mint=target_mint,
                 amount=sell_lamports,
             )
-            if swap_tx_res.is_error:
+
+            if swap_tx_res.is_err:
+                error_msg = swap_tx_res.err_value
+                logging.warning(f"[SWAP] Attempt {attempt} failed: {error_msg}")
+
                 if attempt == max_retries:
-                    log_trade_result(investment_id, wallet_pk, "failed", error_message=swap_tx_res.error)
-                    return swap_tx_res
-                logging.warning(f"[SWAP] Attempt {attempt} failed. Retrying...")
+                    log_trade_result(
+                        investment_id=investment_id,
+                        wallet_pk=wallet_pk,
+                        status="failed",
+                        error_message=error_msg
+                    )
+                    return Err(f"Helius swap failed after {max_retries} attempts: {error_msg}")
+
                 time.sleep(2)
                 continue
 
-            tx_base64 = swap_tx_res.value
+            tx_base64 = swap_tx_res.ok_value
 
-            # 4. Sign and send transaction
+            # === 3. Sign and send transaction ===
             send_res = sign_and_send_transaction(tx_base64, keypair)
-            if send_res.is_error:
+
+            if send_res.is_err:
+                error_msg = send_res.err_value
+                logging.warning(f"[SWAP] Sign/Send failed on attempt {attempt}: {error_msg}")
+
                 if attempt == max_retries:
-                    log_trade_result(investment_id, wallet_pk, "failed", error_message=send_res.error)
-                    return send_res
+                    log_trade_result(
+                        investment_id=investment_id,
+                        wallet_pk=wallet_pk,
+                        status="failed",
+                        error_message=error_msg
+                    )
+                    return Err(f"Failed to sign/send after {max_retries} attempts: {error_msg}")
+
                 time.sleep(2)
                 continue
 
-            tx_sig = send_res.value
+            tx_sig = send_res.ok_value
             logging.info(f"[SWAP] Transaction sent: {tx_sig}")
 
-            # 5. Confirm transaction
+            # === 4. Confirm Transaction ===
             confirm_res = confirm_transaction(tx_sig)
-            if confirm_res.is_error:
-                log_trade_result(investment_id, wallet_pk, "failed", error_message=confirm_res.error)
-                return confirm_res
 
-            # 6. Record, spend gas, withhold tax (existing logic)
-            # ...
+            if confirm_res.is_err:
+                error_msg = confirm_res.err_value
+                log_trade_result(
+                    investment_id=investment_id,
+                    wallet_pk=wallet_pk,
+                    status="failed",
+                    error_message=error_msg
+                )
+                return Err(f"Transaction confirmation failed: {error_msg}")
 
-            log_trade_result(investment_id, wallet_pk, status="success", tx_signature=tx_sig)
+            logging.info(f"[CONFIRM] Transaction confirmed: {tx_sig}")
+
+            # === 5. Record, Spend Gas, Withhold Tax ===
+            # (keep your existing record_partial_sell, spend_gas_security, and tax logic here)
+
+            # === 6. Log Success ===
+            log_trade_result(
+                investment_id=investment_id,
+                wallet_pk=wallet_pk,
+                status="success",
+                tx_signature=tx_sig,
+                sold_lamports=sell_lamports,
+            )
 
             return Ok({
                 "status": "success",
+                "investment_id": investment_id,
                 "tx_signature": tx_sig,
                 # add other fields as needed
             })
@@ -711,8 +739,13 @@ def execute_trade_with_gas(
         except Exception as e:
             logging.exception(f"[TRADE] Unexpected error on attempt {attempt}")
             if attempt == max_retries:
-                log_trade_result(investment_id, wallet_pk, "failed", error_message=str(e))
-                return Err(str(e))
+                log_trade_result(
+                    investment_id=investment_id,
+                    wallet_pk=wallet_pk,
+                    status="failed",
+                    error_message=str(e)
+                )
+                return Err(f"Trade failed after {max_retries} attempts: {str(e)}")
             time.sleep(2)
 
     return Err(f"Trade failed after {max_retries} attempts")
