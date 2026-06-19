@@ -14,6 +14,7 @@ import numpy as np
 import base58
 import logging
 import time
+from global_values import WORLD_STABLE_COIN
 from contextlib import contextmanager
 
 from sqlalchemy import create_engine, select, func
@@ -726,3 +727,21 @@ def get_wallet_id_by_public_key(db_session: Session, public_key: str) -> Optiona
     except Exception as e:
         logging.error(f"[get_wallet_id_by_public_key] {e}")
         return None
+
+
+def get_wallet_for_asset(session: Session, asset_id: int) -> Result[int]:
+    """
+    Returns the wallet primary key (wallet_pk) that owns the given asset.
+    """
+    try:
+        asset = session.execute(
+            select(Asset).where(Asset.id == asset_id)
+        ).scalar_one_or_none()
+
+        if not asset:
+            return Err(f"Asset with id {asset_id} not found")
+
+        return Ok(asset.wallet)
+
+    except Exception as e:
+        return Err(str(e))
