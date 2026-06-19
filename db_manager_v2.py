@@ -732,6 +732,7 @@ def get_wallet_id_by_public_key(db_session: Session, public_key: str) -> Optiona
 def get_wallet_for_asset(session: Session, asset_id: int) -> Result[int]:
     """
     Returns the wallet primary key (wallet_pk) that owns the given asset.
+    Uses your custom Result class.
     """
     try:
         asset = session.execute(
