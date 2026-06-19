@@ -24,7 +24,15 @@ from sqlalchemy import Integer, String, Boolean, BigInteger, LargeBinary, Float,
 from pydantic import BaseModel, Field
 from result import Result, Ok, Err
 
+import os
+from dotenv import load_dotenv
+import requests
+
 Base = declarative_base()
+
+load_dotenv()
+
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 
 # =============================================================================
 # 1. MODELS & SCHEMAS
@@ -184,9 +192,32 @@ def get_token_key(given_key: str) -> Result[np.ndarray]:
         return Err(str(e))
 
 
-def ensure_asset_exists(session: Session, token_key: np.ndarray, wallet_pk: int) -> Result[int]:
-    # ... (implementation stays similar)
-    pass
+def ensure_asset_exists(
+    session: Session, token_key: np.ndarray, wallet_pk: int
+) -> Result[int]:
+    """Ensure asset row exists for (wallet, token). Returns asset.id."""
+    does_exist = session.query(
+        session.query(Asset).filter_by(coin=cast(token_key, BYTEA)).exists()
+    ).scalar()
+
+    if not does_exist:
+        asset_obj = Asset(
+            wallet=wallet_pk,
+            coin=cast(token_key, BYTEA),
+            isNative=False,
+            isOfficialStable=False,
+            isAltStable=False,
+        )
+        session.add(asset_obj)
+        session.flush()
+
+    try:
+        asset = session.execute(
+            select(Asset).filter_by(coin=cast(token_key, BYTEA))
+        ).scalar_one()
+        return Ok(asset.id)
+    except Exception as e:
+        return Err(str(e))
 
 
 def aquire_wallet_key(session: Session, wallet_id: Optional[int] = None, wallet_public_key: Optional[str] = None) -> Result[int]:
@@ -198,17 +229,86 @@ def aquire_wallet_key(session: Session, wallet_id: Optional[int] = None, wallet_
 # 4. INVESTMENT OPERATIONS
 # =============================================================================
 
-def insert_investment(session: Session, token_key: np.ndarray, data: InvestmentCreate, wallet_pk: int) -> Result[bool]:
-    """Insert a new investment position."""
-    # Implementation...
-    pass
+def insert_investment(
+    session: Session,
+    token_key: np.ndarray,
+    investment_data: InvestmentCreate,
+    wallet_id: Optional[int] = None,
+    wallet_public_key: Optional[str] = None,
+) -> Result[bool]:
+    """Insert a new investment. Clean, session-based."""
+    wallet_res = aquire_wallet_key(session, wallet_id, wallet_public_key)
+    if wallet_res.is_error:
+        return Err(f"Wallet error: {wallet_res.error}")
+
+    asset_res = ensure_asset_exists(session, token_key, wallet_res.value)
+    if asset_res.is_error:
+        return asset_res
+
+    try:
+        data = investment_data.model_dump()
+        data["parent_id"] = asset_res.value
+        inv = Investment(**data)
+        session.add(inv)
+        session.flush()
+        return Ok(True)
+    except Exception as exc:
+        session.rollback()
+        return Err(str(exc))
 
 
-def record_partial_sell(session: Session, investment_id: int, sold_lamports: int,
-                        sell_tx_id: str, sell_price_usdc: float, sell_fee_usdc: float = 0.0) -> Result[bool]:
-    """Close (part of) an investment and optionally create remaining position."""
-    # Implementation...
-    pass
+def record_partial_sell(
+    session: Session,
+    investment_id: int,
+    sold_lamports: int,
+    sell_tx_id: str,
+    sell_price_usdc: float,
+    sell_fee_usdc: float = 0.0,
+) -> Result[bool]:
+    """
+    Close part (or all) of an investment.
+    If there's remaining amount, create a new open investment for it.
+    """
+    try:
+        inv = session.execute(
+            select(Investment).where(Investment.id == investment_id)
+        ).scalar_one()
+
+        if inv.isClosed:
+            return Err("Investment already closed")
+
+        remaining = inv.amount - sold_lamports
+        if remaining < 0:
+            return Err("Sold more lamports than available")
+
+        # Close the sold portion
+        inv.amount = sold_lamports
+        inv.isClosed = True
+        inv.sell_tx_id = sell_tx_id
+        inv.sale_price_usdc = sell_price_usdc
+        inv.sell_fee_usdc = sell_fee_usdc
+        inv.sale_time_ms = int(time.time() * 1000)
+
+        # Create remaining open investment if anything is left
+        if remaining > 0:
+            new_inv = Investment(
+                parent_id=inv.parent_id,
+                amount=remaining,
+                purchase_price_usdc=inv.purchase_price_usdc,
+                purchase_time_ms=inv.purchase_time_ms,
+                buy_fee_native_lamports=inv.buy_fee_native_lamports,
+                buy_fee_usdc=inv.buy_fee_usdc,
+                buy_tx_id=inv.buy_tx_id,
+                isClosed=False,
+            )
+            session.add(new_inv)
+
+        session.flush()
+        return Ok(True)
+
+    except Exception as e:
+        session.rollback()
+        return Err(str(e))
 
 
 def calculate_realized_gain(session: Session, investment_id: int, sell_price_usdc: float) -> Result[dict]:
@@ -493,4 +593,66 @@ def get_open_investments(session: Session, wallet_pk: int) -> Result[List[dict]]
         return Err(str(e))
 
 
+import requests
+import os
+from result import Result, Ok, Err
 
+
+def execute_jupiter_swap_via_helius(
+    helius_api_key: str,
+    wallet_public_key: str,
+    input_mint: str,
+    output_mint: str,
+    amount: int,
+    slippage_bps: int = 50,
+    priority_fee: float = 0.0005  # in SOL, adjust as needed
+) -> Result[dict]:
+    """
+    Executes a Jupiter swap using Helius Swap Sender.
+    Returns transaction signature and basic info on success.
+    """
+    if not helius_api_key:
+        return Err("Helius API key is missing")
+
+    url = f"https://mainnet.helius-rpc.com/?api-key={helius_api_key}"
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": "helius-swap",
+        "method": "getJupiterSwapTransaction",
+        "params": {
+            "inputMint": input_mint,
+            "outputMint": output_mint,
+            "amount": str(amount),
+            "slippageBps": slippage_bps,
+            "userPublicKey": wallet_public_key,
+            "prioritizationFeeLamports": int(priority_fee * 1_000_000_000),
+        }
+    }
+
+    try:
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+
+        if "error" in data:
+            return Err(f"Helius error: {data['error']}")
+
+        result = data.get("result", {})
+        tx_signature = result.get("signature") or result.get("swapTransaction")
+
+        if not tx_signature:
+            return Err("No transaction signature returned from Helius")
+
+        return Ok({
+            "status": "submitted",
+            "signature": tx_signature,
+            "input_mint": input_mint,
+            "output_mint": output_mint,
+            "amount": amount,
+        })
+
+    except requests.exceptions.RequestException as e:
+        return Err(f"Request failed: {str(e)}")
+    except Exception as e:
+        return Err(f"Unexpected error: {str(e)}")
