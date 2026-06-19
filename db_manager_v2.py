@@ -268,13 +268,54 @@ def get_open_tax_securities(session: Session, wallet_pk: int) -> Result[List[Sec
 def execute_trade_with_gas(
     session: Session,
     investment_id: int,
-    jupiter_client: Any,
+    jupiter_client,                    # your JupiterSwapClient instance
     target_mint: str,
     estimated_gas_lamports: int,
     wallet_pk: int,
-    keypair: Any = None,
+    keypair=None,
     gas_security_id: Optional[int] = None,
 ) -> Result[dict]:
+    """
+    High-level helper that orchestrates a full trade with gas handling.
+
+    Steps:
+    1. Run pre-trade safety checks (investment, gas, tax readiness)
+    2. Check we have enough gas security
+    3. Get real quote from Jupiter
+    4. Execute the swap
+    5. Record the partial investment sell with real amounts/tx
+    6. Spend gas + withhold tax
+    """
+    # === SAFETY RAILS ===
+    # For now we assume we're selling half. In real use, pass the actual amount.
+    inv = session.execute(select(Investment).where(Investment.id == investment_id)).scalar_one_or_none()
+    sell_lamports = inv.amount // 2 if inv else 0
+
+    safety = pre_trade_safety_check(
+        session=session,
+        investment_id=investment_id,
+        sell_lamports=sell_lamports,
+        estimated_gas_lamports=estimated_gas_lamports,
+        wallet_pk=wallet_pk
+    )
+    if safety.is_error:
+        return Err(f"Safety check failed: {safety.error}")
+
+    # 1. Pre-trade gas check (redundant but kept for clarity)
+    gas_check = ensure_sufficient_gas(session, estimated_gas_lamports, wallet_pk)
+    if gas_check.is_error:
+        return gas_check
+
+    # Auto-pick oldest gas security if none provided
+    if gas_security_id is None:
+        oldest_res = get_oldest_gas_security(session, wallet_pk)
+        if oldest_res.is_ok and oldest_res.value:
+            gas_security_id = oldest_res.value
+            logging.info(f"Auto-selected oldest gas security: {gas_security_id}")
+        else:
+            logging.warning("No open gas security found — trade will continue without deducting gas Security")
+
+    logging.info(f"[execute_trade_with_gas] Starting trade for investment {investment_id}")
     """
     Main orchestrator.
     
@@ -308,3 +349,61 @@ def execute_trade_with_gas(
     withhold_tax_on_profitable_sale(session, investment_id, sell_price_usdc, wallet_pk)
 
     return Ok({...})
+
+
+# ============================ SAFETY RAILS ============================
+
+def pre_trade_safety_check(
+    session: Session,
+    investment_id: int,
+    sell_lamports: int,
+    estimated_gas_lamports: int,
+    wallet_pk: int
+) -> Result[dict]:
+    """
+    Runs multiple safety checks before executing a trade.
+    Returns detailed status so we can decide whether to proceed.
+    """
+    issues = []
+    warnings = []
+
+    try:
+        # 1. Check investment exists and is open
+        inv = session.execute(
+            select(Investment).where(Investment.id == investment_id)
+        ).scalar_one_or_none()
+
+        if not inv:
+            issues.append("Investment does not exist")
+        elif inv.isClosed:
+            issues.append("Investment is already closed")
+        elif sell_lamports > inv.amount:
+            issues.append(f"Trying to sell more lamports ({sell_lamports}) than available ({inv.amount})")
+
+        # 2. Gas check
+        gas_res = ensure_sufficient_gas(session, estimated_gas_lamports, wallet_pk)
+        if gas_res.is_error:
+            issues.append(gas_res.error)
+
+        # 3. Basic tax readiness check
+        wallet = session.execute(select(Wallet).where(Wallet.id == wallet_pk)).scalar_one_or_none()
+        if wallet:
+            user = session.execute(select(User).where(User.id == wallet.parent_id)).scalar_one_or_none()
+            if user and (user.tax_level_choice is None or user.tax_level_choice <= 0):
+                warnings.append("User tax_level_choice is not set or is zero — tax will not be withheld on profits")
+
+        if issues:
+            return Err({
+                "status": "blocked",
+                "issues": issues,
+                "warnings": warnings
+            })
+
+        return Ok({
+            "status": "ok",
+            "warnings": warnings,
+            "checks_passed": ["investment_open", "sufficient_gas"]
+        })
+
+    except Exception as e:
+        return Err({"status": "error", "message": str(e)})
