@@ -384,7 +384,7 @@ def get_open_tax_securities(session: Session, wallet_pk: int) -> Result[List[Sec
 def execute_trade_with_gas(
     session: Session,
     investment_id: int,
-    jupiter_client,                    # your JupiterSwapClient instance
+    jupiter_client,                    # Your Jupiter/Helius client (can be placeholder for now)
     target_mint: str,
     estimated_gas_lamports: int,
     wallet_pk: int,
@@ -392,20 +392,25 @@ def execute_trade_with_gas(
     gas_security_id: Optional[int] = None,
 ) -> Result[dict]:
     """
-    High-level helper that orchestrates a full trade with gas handling.
+    High-level orchestrator for executing a trade with safety, gas, and tax handling.
 
-    Steps:
-    1. Run pre-trade safety checks (investment, gas, tax readiness)
-    2. Check we have enough gas security
-    3. Get real quote from Jupiter
-    4. Execute the swap
-    5. Record the partial investment sell with real amounts/tx
-    6. Spend gas + withhold tax
+    Flow:
+    1. Run pre-trade safety checks
+    2. Ensure sufficient gas
+    3. Execute Jupiter/Helius swap
+    4. Record the partial sell in DB
+    5. Spend gas from security
+    6. Automatically withhold tax on profitable trades
     """
-    # === SAFETY RAILS ===
-    # For now we assume we're selling half. In real use, pass the actual amount.
-    inv = session.execute(select(Investment).where(Investment.id == investment_id)).scalar_one_or_none()
-    sell_lamports = inv.amount // 2 if inv else 0
+    # === 1. SAFETY RAILS ===
+    inv = session.execute(
+        select(Investment).where(Investment.id == investment_id)
+    ).scalar_one_or_none()
+
+    if not inv:
+        return Err("Investment does not exist")
+
+    sell_lamports = inv.amount // 2  # Currently sells half. Change this when needed.
 
     safety = pre_trade_safety_check(
         session=session,
@@ -417,54 +422,75 @@ def execute_trade_with_gas(
     if safety.is_error:
         return Err(f"Safety check failed: {safety.error}")
 
-    # 1. Pre-trade gas check (redundant but kept for clarity)
+    # === 2. GAS CHECK ===
     gas_check = ensure_sufficient_gas(session, estimated_gas_lamports, wallet_pk)
     if gas_check.is_error:
         return gas_check
 
-    # Auto-pick oldest gas security if none provided
+    # Auto-select oldest gas security if none provided
     if gas_security_id is None:
         oldest_res = get_oldest_gas_security(session, wallet_pk)
         if oldest_res.is_ok and oldest_res.value:
             gas_security_id = oldest_res.value
             logging.info(f"Auto-selected oldest gas security: {gas_security_id}")
-        else:
-            logging.warning("No open gas security found — trade will continue without deducting gas Security")
 
     logging.info(f"[execute_trade_with_gas] Starting trade for investment {investment_id}")
-    """
-    Main orchestrator.
-    
-    This function coordinates:
-    - Gas check + spending
-    - Jupiter swap execution
-    - Investment recording
-    - Automatic tax withholding
-    
-    Good candidate to keep in Python or move orchestration to Rust later.
-    """
-    # 1. Gas pre-check
-    if ensure_sufficient_gas(session, estimated_gas_lamports, wallet_pk).is_error:
-        return Err("Insufficient gas")
 
-    # 2. Auto-select oldest gas security if not provided
-    if gas_security_id is None:
-        gas_security_id = get_oldest_gas_security(session, wallet_pk).value
+    # === 3. JUPITER / HELIUS SWAP ===
+    # TODO: Replace this section with real Helius/Jupiter integration
+    from_mint = WORLD_STABLE_COIN  # Define this constant somewhere (e.g. USDC mint)
 
-    # 3. Execute Jupiter swap (placeholder for real implementation)
-    # ... call jupiter_client.get_quote() + execute_swap()
+    # Placeholder quote + swap (replace with real call later)
+    # For now we simulate a successful swap
+    tx_sig = f"devnet_tx_{int(time.time())}"
+    received_amount = int(sell_lamports * 0.98)  # Fake 2% slippage
+    sell_price_usdc = received_amount / 1_000_000
 
-    # 4. Record investment change
-    record_partial_sell(...)  
+    logging.info(f"[Jupiter/Helius] Simulated swap. Tx: {tx_sig}")
 
-    # 5. Spend gas
+    # === 4. RECORD THE PARTIAL SELL ===
+    record_res = record_partial_sell(
+        session=session,
+        investment_id=investment_id,
+        sold_lamports=sell_lamports,
+        sell_tx_id=tx_sig,
+        sell_price_usdc=sell_price_usdc,
+    )
+    if record_res.is_error:
+        return record_res
+
+    # === 5. SPEND GAS ===
     if gas_security_id:
-        spend_gas_security(session, gas_security_id, estimated_gas_lamports, tx_sig)
+        spend_res = spend_gas_security(
+            session=session,
+            gas_security_id=gas_security_id,
+            used_lamports=estimated_gas_lamports,
+            tx_id=f"gas_{tx_sig[:8]}"
+        )
+        if spend_res.is_error:
+            logging.warning(f"Gas spend warning: {spend_res.error}")
 
-    # 6. Automatic tax withholding (critical business rule)
-    withhold_tax_on_profitable_sale(session, investment_id, sell_price_usdc, wallet_pk)
+    # === 6. AUTOMATIC TAX WITHHOLDING ===
+    tax_res = withhold_tax_on_profitable_sale(
+        session=session,
+        investment_id=investment_id,
+        sell_proceeds_usdc=sell_price_usdc,
+        wallet_pk=wallet_pk
+    )
+    if tax_res.is_error:
+        logging.warning(f"Tax withholding warning: {tax_res.error}")
 
-    return Ok({...})
+    return Ok({
+        "status": "success",
+        "investment_id": investment_id,
+        "sold_lamports": sell_lamports,
+        "tx_signature": tx_sig,
+        "received_amount_lamports": received_amount,
+        "sell_price_usdc": sell_price_usdc,
+        "gas_used_lamports": estimated_gas_lamports,
+        "gas_security_id": gas_security_id,
+        "tax_withheld": tax_res.value if tax_res.is_ok else False,
+    })
 
 
 # ============================ SAFETY RAILS ============================
