@@ -14,6 +14,7 @@ import numpy as np
 import base58
 import logging
 import time
+from datetime import datetime
 from global_values import WORLD_STABLE_COIN
 from contextlib import contextmanager
 
@@ -541,20 +542,28 @@ def execute_trade_with_gas(
     gas_security_id: Optional[int] = None,
 ) -> Result[dict]:
     """
-    High-level trade orchestrator with safety rails, gas handling, and tax withholding.
+    High-level trade orchestrator.
+    Includes safety checks, gas handling, tax withholding, and result logging.
     """
-    logging.info(f"[TRADE] Starting trade for investment_id={investment_id}, wallet={wallet_pk}")
+    logging.info(f"[TRADE] Starting trade | investment_id={investment_id} | wallet={wallet_pk}")
 
-    # === 1. SAFETY CHECK ===
+    inv = None
+    sell_lamports = 0
+    tx_sig = None
+    received_amount = 0
+    sell_price_usdc = 0.0
+
     try:
+        # === 1. SAFETY CHECK ===
         inv = session.execute(
             select(Investment).where(Investment.id == investment_id)
         ).scalar_one_or_none()
 
         if not inv:
-            return Err(f"Investment {investment_id} not found")
+            log_trade_result(investment_id, wallet_pk, "failed", error_message="Investment not found")
+            return Err("Investment not found")
 
-        sell_lamports = inv.amount // 2  # For now we sell half
+        sell_lamports = inv.amount // 2
 
         safety = pre_trade_safety_check(
             session=session,
@@ -565,85 +574,99 @@ def execute_trade_with_gas(
         )
 
         if safety.is_error:
-            logging.error(f"[SAFETY] Trade blocked: {safety.error}")
+            log_trade_result(investment_id, wallet_pk, "failed", error_message=safety.error)
             return Err(f"Safety check failed: {safety.error}")
 
         if safety.value.get("warnings"):
-            logging.warning(f"[SAFETY] Warnings: {safety.value['warnings']}")
+            logging.warning(f"[SAFETY] {safety.value['warnings']}")
+
+        # === 2. GAS PREPARATION ===
+        if gas_security_id is None:
+            oldest = get_oldest_gas_security(session, wallet_pk)
+            if oldest.is_ok and oldest.value:
+                gas_security_id = oldest.value
+
+        gas_check = ensure_sufficient_gas(session, estimated_gas_lamports, wallet_pk)
+        if gas_check.is_error:
+            log_trade_result(investment_id, wallet_pk, "failed", error_message=gas_check.error)
+            return gas_check
+
+        # === 3. EXECUTE SWAP (Placeholder for now) ===
+        logging.info("[SWAP] Executing swap (placeholder)...")
+
+        # TODO: Replace this block with real Helius / Jupiter call
+        tx_sig = f"devnet_tx_{int(time.time())}"
+        received_amount = 1234567890          # placeholder
+        sell_price_usdc = received_amount / 1_000_000
+
+        logging.info(f"[SWAP] Completed | tx={tx_sig} | received={received_amount}")
+
+        # === 4. RECORD PARTIAL SELL ===
+        record_res = record_partial_sell(
+            session=session,
+            investment_id=investment_id,
+            sold_lamports=sell_lamports,
+            sell_tx_id=tx_sig,
+            sell_price_usdc=sell_price_usdc,
+        )
+        if record_res.is_error:
+            log_trade_result(investment_id, wallet_pk, "failed", error_message=record_res.error)
+            return record_res
+
+        # === 5. SPEND GAS ===
+        if gas_security_id:
+            spend_res = spend_gas_security(
+                session=session,
+                gas_security_id=gas_security_id,
+                used_lamports=estimated_gas_lamports,
+                tx_id="gas_" + tx_sig[:8]
+            )
+            if spend_res.is_error:
+                logging.warning(f"[GAS] Could not spend gas security: {spend_res.error}")
+
+        # === 6. WITHHOLD TAX ===
+        tax_res = withhold_tax_on_profitable_sale(
+            session=session,
+            investment_id=investment_id,
+            sell_proceeds_usdc=sell_price_usdc,
+            wallet_pk=wallet_pk
+        )
+        if tax_res.is_error:
+            logging.warning(f"[TAX] Tax withholding failed: {tax_res.error}")
+
+        # === 7. LOG SUCCESS ===
+        log_trade_result(
+            investment_id=investment_id,
+            wallet_pk=wallet_pk,
+            status="success",
+            tx_signature=tx_sig,
+            sold_lamports=sell_lamports,
+            received_amount=received_amount,
+            sell_price_usdc=sell_price_usdc,
+        )
+
+        logging.info(f"[TRADE] Trade completed successfully | investment_id={investment_id}")
+
+        return Ok({
+            "status": "success",
+            "investment_id": investment_id,
+            "tx_signature": tx_sig,
+            "sold_lamports": sell_lamports,
+            "received_amount": received_amount,
+            "sell_price_usdc": sell_price_usdc,
+            "gas_security_id": gas_security_id,
+            "tax_withheld": tax_res.value if tax_res.is_ok else False,
+        })
 
     except Exception as e:
-        logging.exception("[SAFETY] Unexpected error during safety check")
-        return Err(f"Safety check crashed: {str(e)}")
-
-    # === 2. GAS HANDLING ===
-    if gas_security_id is None:
-        oldest = get_oldest_gas_security(session, wallet_pk)
-        if oldest.is_ok and oldest.value:
-            gas_security_id = oldest.value
-            logging.info(f"[GAS] Auto-selected oldest gas security: {gas_security_id}")
-        else:
-            logging.warning("[GAS] No open gas security found")
-
-    gas_check = ensure_sufficient_gas(session, estimated_gas_lamports, wallet_pk)
-    if gas_check.is_error:
-        logging.error(f"[GAS] Insufficient gas: {gas_check.error}")
-        return gas_check
-
-    # === 3. EXECUTE SWAP (Placeholder for now) ===
-    logging.info("[SWAP] Executing swap via Jupiter/Helius (placeholder)...")
-
-    # TODO: Replace this section with real Helius or Jupiter call
-    tx_sig = "devnet_tx_" + str(int(time.time()))
-    received_amount = 1234567890   # placeholder
-    sell_price_usdc = received_amount / 1_000_000
-
-    logging.info(f"[SWAP] Swap completed. tx={tx_sig}, received={received_amount}")
-
-    # === 4. RECORD TRADE ===
-    record_res = record_partial_sell(
-        session=session,
-        investment_id=investment_id,
-        sold_lamports=sell_lamports,
-        sell_tx_id=tx_sig,
-        sell_price_usdc=sell_price_usdc,
-    )
-    if record_res.is_error:
-        logging.error(f"[RECORD] Failed to record partial sell: {record_res.error}")
-        return record_res
-
-    # === 5. SPEND GAS ===
-    if gas_security_id:
-        spend_res = spend_gas_security(
-            session=session,
-            gas_security_id=gas_security_id,
-            used_lamports=estimated_gas_lamports,
-            tx_id="gas_" + tx_sig[:8]
+        logging.exception("[TRADE] Unexpected error during trade execution")
+        log_trade_result(
+            investment_id=investment_id,
+            wallet_pk=wallet_pk,
+            status="failed",
+            error_message=str(e),
         )
-        if spend_res.is_error:
-            logging.warning(f"[GAS] Failed to spend gas security: {spend_res.error}")
-
-    # === 6. WITHHOLD TAX ===
-    tax_res = withhold_tax_on_profitable_sale(
-        session=session,
-        investment_id=investment_id,
-        sell_proceeds_usdc=sell_price_usdc,
-        wallet_pk=wallet_pk
-    )
-    if tax_res.is_error:
-        logging.warning(f"[TAX] Tax withholding failed: {tax_res.error}")
-
-    logging.info(f"[TRADE] Trade completed successfully for investment {investment_id}")
-
-    return Ok({
-        "status": "success",
-        "investment_id": investment_id,
-        "tx_signature": tx_sig,
-        "sold_lamports": sell_lamports,
-        "received_amount": received_amount,
-        "sell_price_usdc": sell_price_usdc,
-        "gas_security_id": gas_security_id,
-        "tax_withheld": tax_res.value if tax_res.is_ok else False,
-    })
+        return Err(f"Trade failed with unexpected error: {str(e)}")
 
 
 # ============================ SAFETY RAILS ============================
@@ -901,3 +924,39 @@ def get_wallet_for_asset(session: Session, asset_id: int) -> Result[int]:
 
     except Exception as e:
         return Err(str(e))
+
+
+def log_trade_result(
+    investment_id: int,
+    wallet_pk: int,
+    status: str,                    # "success" or "failed"
+    tx_signature: str = None,
+    sold_lamports: int = None,
+    received_amount: int = None,
+    sell_price_usdc: float = None,
+    error_message: str = None,
+    extra_info: dict = None
+):
+    """
+    Simple trade result logger using Python logging.
+    Easy to extend later with database persistence.
+    """
+    log_entry = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "investment_id": investment_id,
+        "wallet_id": wallet_pk,
+        "status": status,
+        "tx_signature": tx_signature,
+        "sold_lamports": sold_lamports,
+        "received_amount": received_amount,
+        "sell_price_usdc": sell_price_usdc,
+        "error_message": error_message,
+    }
+
+    if extra_info:
+        log_entry.update(extra_info)
+
+    if status.lower() == "success":
+        logging.info(f"[TRADE] {log_entry}")
+    else:
+        logging.error(f"[TRADE] {log_entry}")
