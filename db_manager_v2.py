@@ -535,36 +535,38 @@ def get_open_tax_securities(session: Session, wallet_pk: int) -> Result[List[Sec
 # =============================================================================
 
 
+
 def execute_trade_with_gas(
     session: Session,
     investment_id: int,
-    jupiter_client,                    # Will be replaced with Helius later
     target_mint: str,
     estimated_gas_lamports: int,
     wallet_pk: int,
-    keypair=None,
     gas_security_id: Optional[int] = None,
+    helius_api_key: str = None,
+    wallet_public_key: str = None,
 ) -> Result[dict]:
     """
-    High-level trade orchestrator.
+    High-level trade orchestrator using Helius for Jupiter swaps.
     Includes safety checks, gas handling, tax withholding, and result logging.
     """
-    logging.info(f"[TRADE] Starting trade | investment_id={investment_id} | wallet={wallet_pk}")
+    logging.info(f"[TRADE] Starting trade for investment_id={investment_id}")
 
-    inv = None
-    sell_lamports = 0
-    tx_sig = None
-    received_amount = 0
-    sell_price_usdc = 0.0
+    # Load from environment variables if not passed explicitly
+    helius_api_key = helius_api_key or os.getenv("HELIUS_API_KEY")
+    wallet_public_key = wallet_public_key or os.getenv("WALLET_PUBLIC_KEY")
+
+    if not helius_api_key or not wallet_public_key:
+        return Err("Missing HELIUS_API_KEY or WALLET_PUBLIC_KEY in environment variables")
 
     try:
-        # === 1. SAFETY CHECK ===
+        # === 1. Load Investment & Safety Check ===
         inv = session.execute(
             select(Investment).where(Investment.id == investment_id)
         ).scalar_one_or_none()
 
         if not inv:
-            log_trade_result(investment_id, wallet_pk, "failed", error_message="Investment not found")
+            log_trade_result(investment_id, wallet_pk, status="failed", error_message="Investment not found")
             return Err("Investment not found")
 
         sell_lamports = inv.amount // 2
@@ -576,15 +578,11 @@ def execute_trade_with_gas(
             estimated_gas_lamports=estimated_gas_lamports,
             wallet_pk=wallet_pk
         )
-
         if safety.is_error:
-            log_trade_result(investment_id, wallet_pk, "failed", error_message=safety.error)
+            log_trade_result(investment_id, wallet_pk, status="failed", error_message=safety.error)
             return Err(f"Safety check failed: {safety.error}")
 
-        if safety.value.get("warnings"):
-            logging.warning(f"[SAFETY] {safety.value['warnings']}")
-
-        # === 2. GAS PREPARATION ===
+        # === 2. Gas Check ===
         if gas_security_id is None:
             oldest = get_oldest_gas_security(session, wallet_pk)
             if oldest.is_ok and oldest.value:
@@ -592,20 +590,32 @@ def execute_trade_with_gas(
 
         gas_check = ensure_sufficient_gas(session, estimated_gas_lamports, wallet_pk)
         if gas_check.is_error:
-            log_trade_result(investment_id, wallet_pk, "failed", error_message=gas_check.error)
+            log_trade_result(investment_id, wallet_pk, status="failed", error_message=gas_check.error)
             return gas_check
 
-        # === 3. EXECUTE SWAP (Placeholder for now) ===
-        logging.info("[SWAP] Executing swap (placeholder)...")
+        # === 3. Execute Swap via Helius ===
+        logging.info("[SWAP] Calling Helius Jupiter Swap...")
 
-        # TODO: Replace this block with real Helius / Jupiter call
-        tx_sig = f"devnet_tx_{int(time.time())}"
-        received_amount = 1234567890          # placeholder
-        sell_price_usdc = received_amount / 1_000_000
+        swap_res = execute_jupiter_swap_via_helius(
+            input_mint=WORLD_STABLE_COIN,      # e.g. USDC
+            output_mint=target_mint,
+            amount=sell_lamports,
+            slippage_bps=50,
+            helius_api_key=helius_api_key,
+            wallet_public_key=wallet_public_key,
+        )
 
-        logging.info(f"[SWAP] Completed | tx={tx_sig} | received={received_amount}")
+        if swap_res.is_error:
+            log_trade_result(investment_id, wallet_pk, status="failed", error_message=swap_res.error)
+            return Err(f"Helius swap failed: {swap_res.error}")
 
-        # === 4. RECORD PARTIAL SELL ===
+        tx_sig = swap_res.value["signature"]
+        received_amount = swap_res.value.get("received_amount", 0)  # Update if Helius returns this
+        sell_price_usdc = received_amount / 1_000_000 if received_amount else 0.0
+
+        logging.info(f"[SWAP] Success | tx={tx_sig}")
+
+        # === 4. Record Partial Sell ===
         record_res = record_partial_sell(
             session=session,
             investment_id=investment_id,
@@ -614,10 +624,10 @@ def execute_trade_with_gas(
             sell_price_usdc=sell_price_usdc,
         )
         if record_res.is_error:
-            log_trade_result(investment_id, wallet_pk, "failed", error_message=record_res.error)
+            log_trade_result(investment_id, wallet_pk, status="failed", error_message=record_res.error)
             return record_res
 
-        # === 5. SPEND GAS ===
+        # === 5. Spend Gas ===
         if gas_security_id:
             spend_res = spend_gas_security(
                 session=session,
@@ -628,7 +638,7 @@ def execute_trade_with_gas(
             if spend_res.is_error:
                 logging.warning(f"[GAS] Could not spend gas security: {spend_res.error}")
 
-        # === 6. WITHHOLD TAX ===
+        # === 6. Withhold Tax ===
         tax_res = withhold_tax_on_profitable_sale(
             session=session,
             investment_id=investment_id,
@@ -638,7 +648,7 @@ def execute_trade_with_gas(
         if tax_res.is_error:
             logging.warning(f"[TAX] Tax withholding failed: {tax_res.error}")
 
-        # === 7. LOG SUCCESS ===
+        # === 7. Log Success ===
         log_trade_result(
             investment_id=investment_id,
             wallet_pk=wallet_pk,
@@ -649,7 +659,7 @@ def execute_trade_with_gas(
             sell_price_usdc=sell_price_usdc,
         )
 
-        logging.info(f"[TRADE] Trade completed successfully | investment_id={investment_id}")
+        logging.info(f"[TRADE] Completed successfully | investment_id={investment_id}")
 
         return Ok({
             "status": "success",
@@ -663,14 +673,9 @@ def execute_trade_with_gas(
         })
 
     except Exception as e:
-        logging.exception("[TRADE] Unexpected error during trade execution")
-        log_trade_result(
-            investment_id=investment_id,
-            wallet_pk=wallet_pk,
-            status="failed",
-            error_message=str(e),
-        )
-        return Err(f"Trade failed with unexpected error: {str(e)}")
+        logging.exception("[TRADE] Unexpected error")
+        log_trade_result(investment_id, wallet_pk, status="failed", error_message=str(e))
+        return Err(f"Unexpected error during trade: {str(e)}")
 
 
 # ============================ SAFETY RAILS ============================
@@ -820,26 +825,33 @@ def get_open_investments(session: Session, wallet_pk: int) -> Result[List[dict]]
 
 
 def execute_jupiter_swap_via_helius(
-    helius_api_key: str,
-    wallet_public_key: str,
     input_mint: str,
     output_mint: str,
     amount: int,
     slippage_bps: int = 50,
-    priority_fee: float = 0.0005  # in SOL, adjust as needed
+    priority_fee_lamports: int = 500_000,
+    helius_api_key: str = None,
+    wallet_public_key: str = None,
 ) -> Result[dict]:
     """
     Executes a Jupiter swap using Helius Swap Sender.
-    Returns transaction signature and basic info on success.
+    Automatically reads HELIUS_API_KEY and WALLET_PUBLIC_KEY from environment variables
+    if not passed explicitly.
     """
+    # Load from environment variables if not provided
+    helius_api_key = helius_api_key or os.getenv("HELIUS_API_KEY")
+    wallet_public_key = wallet_public_key or os.getenv("WALLET_PUBLIC_KEY")
+
     if not helius_api_key:
-        return Err("Helius API key is missing")
+        return Err("Helius API key is missing (set HELIUS_API_KEY environment variable)")
+    if not wallet_public_key:
+        return Err("Wallet public key is missing (set WALLET_PUBLIC_KEY environment variable)")
 
     url = f"https://mainnet.helius-rpc.com/?api-key={helius_api_key}"
 
     payload = {
         "jsonrpc": "2.0",
-        "id": "helius-swap",
+        "id": "helius-jupiter-swap",
         "method": "getJupiterSwapTransaction",
         "params": {
             "inputMint": input_mint,
@@ -847,7 +859,7 @@ def execute_jupiter_swap_via_helius(
             "amount": str(amount),
             "slippageBps": slippage_bps,
             "userPublicKey": wallet_public_key,
-            "prioritizationFeeLamports": int(priority_fee * 1_000_000_000),
+            "prioritizationFeeLamports": priority_fee_lamports,
         }
     }
 
@@ -857,26 +869,26 @@ def execute_jupiter_swap_via_helius(
         data = response.json()
 
         if "error" in data:
-            return Err(f"Helius error: {data['error']}")
+            return Err(f"Helius API error: {data['error']}")
 
         result = data.get("result", {})
-        tx_signature = result.get("signature") or result.get("swapTransaction")
+        signature = result.get("signature")
 
-        if not tx_signature:
+        if not signature:
             return Err("No transaction signature returned from Helius")
 
         return Ok({
-            "status": "submitted",
-            "signature": tx_signature,
+            "signature": signature,
             "input_mint": input_mint,
             "output_mint": output_mint,
             "amount": amount,
+            "wallet_public_key": wallet_public_key,
         })
 
     except requests.exceptions.RequestException as e:
-        return Err(f"Request failed: {str(e)}")
+        return Err(f"Helius request failed: {str(e)}")
     except Exception as e:
-        return Err(f"Unexpected error: {str(e)}")
+        return Err(f"Unexpected error during Helius swap: {str(e)}")
 
 
 def is_number_wallets_1(session: Session) -> Result[bool]:
