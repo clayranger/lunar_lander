@@ -407,3 +407,50 @@ def pre_trade_safety_check(
 
     except Exception as e:
         return Err({"status": "error", "message": str(e)})
+
+
+
+# ============================ AUDIT / WALLET SUMMARY ============================
+
+def get_wallet_summary(session: Session, wallet_pk: int) -> Result[dict]:
+    """
+    Returns a high-level summary of the wallet for auditing and monitoring.
+    Useful before making trades to understand current state.
+    """
+    try:
+        # 1. Count open investments
+        open_investments_stmt = select(func.count()).select_from(Investment).join(Asset).where(
+            Asset.wallet == wallet_pk,
+            Investment.isClosed == False
+        )
+        open_investments = session.execute(open_investments_stmt).scalar() or 0
+
+        # 2. Total tax reserved
+        tax_res = get_total_tax_owed(session, wallet_pk)
+        total_tax_reserved = tax_res.value if tax_res.is_ok else 0.0
+
+        # 3. Total gas available (in lamports)
+        gas_res = get_available_gas_lamports(session, wallet_pk)
+        total_gas_lamports = gas_res.value if gas_res.is_ok else 0
+
+        # 4. Total value in open investments (purchase price in USDC)
+        investment_value_stmt = select(func.sum(Investment.purchase_price_usdc)).join(Asset).where(
+            Asset.wallet == wallet_pk,
+            Investment.isClosed == False
+        )
+        total_investment_value_usdc = session.execute(investment_value_stmt).scalar() or 0.0
+
+        summary = {
+            "wallet_id": wallet_pk,
+            "open_investments": open_investments,
+            "total_investment_value_usdc": round(total_investment_value_usdc, 2),
+            "total_tax_reserved_usdc": round(total_tax_reserved, 2),
+            "total_gas_available_lamports": total_gas_lamports,
+            "total_gas_available_sol": round(total_gas_lamports / 1_000_000_000, 6),
+            "timestamp": int(time.time())
+        }
+
+        return Ok(summary)
+
+    except Exception as e:
+        return Err(str(e))
