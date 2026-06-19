@@ -328,49 +328,196 @@ def record_partial_sell(
         return Err(str(e))
 
 
-def calculate_realized_gain(session: Session, investment_id: int, sell_price_usdc: float) -> Result[dict]:
-    """Pure calculation — good candidate for later Rust/Zig if needed."""
-    # Implementation...
-    pass
-
 
 # =============================================================================
 # 5. SECURITY OPERATIONS (Gas + Tax buckets)
 # =============================================================================
 
 def get_available_gas_lamports(session: Session, wallet_pk: int) -> Result[int]:
-    """Get total open gas security in lamports."""
-    pass
+    """Returns total lamports available in open gas securities for this wallet."""
+    try:
+        stmt = (
+            select(func.sum(Security.amount))
+            .join(Asset, Security.parent_id == Asset.id)
+            .where(
+                Asset.wallet == wallet_pk,
+                Security.isGas == True,
+                Security.isClosed == False
+            )
+        )
+        total = session.execute(stmt).scalar() or 0
+        return Ok(int(total))
+    except Exception as e:
+        return Err(str(e))
 
 
 def ensure_sufficient_gas(session: Session, required_lamports: int, wallet_pk: int) -> Result[bool]:
-    pass
+    """Check if the wallet has enough open gas security."""
+    gas_res = get_available_gas_lamports(session, wallet_pk)
+    if gas_res.is_error:
+        return gas_res
+
+    if gas_res.value < required_lamports:
+        return Err(
+            f"Insufficient gas: need {required_lamports} lamports, "
+            f"only {gas_res.value} available"
+        )
+    return Ok(True)
 
 
-def spend_gas_security(session: Session, security_id: int, used_lamports: int, tx_id: str) -> Result[bool]:
-    pass
+def spend_gas_security(
+    session: Session,
+    gas_security_id: int,
+    used_lamports: int,
+    tx_id: str,
+) -> Result[bool]:
+    """Reduce gas from a Security after using it for fees."""
+    try:
+        sec = session.execute(
+            select(Security).where(Security.id == gas_security_id)
+        ).scalar_one()
+
+        if sec.isClosed:
+            return Err("Gas security already closed")
+
+        if used_lamports > sec.amount:
+            return Err("Trying to spend more gas than available")
+
+        remaining = sec.amount - used_lamports
+        sec.amount = max(0, remaining)
+        sec.isClosed = remaining <= 0
+        sec.sell_tx_id = tx_id
+        sec.sale_time_ms = int(time.time() * 1000)
+
+        session.flush()
+        return Ok(True)
+    except Exception as e:
+        session.rollback()
+        return Err(str(e))
 
 
 def get_oldest_gas_security(session: Session, wallet_pk: int) -> Result[Optional[int]]:
-    pass
+    """Get the oldest open gas security ID for auto-selection."""
+    try:
+        stmt = (
+            select(Security.id)
+            .join(Asset, Security.parent_id == Asset.id)
+            .where(
+                Asset.wallet == wallet_pk,
+                Security.isGas == True,
+                Security.isClosed == False
+            )
+            .order_by(Security.purchase_time_ms.asc())
+            .limit(1)
+        )
+        sec_id = session.execute(stmt).scalar()
+        return Ok(sec_id)
+    except Exception as e:
+        return Err(str(e))
 
 
 # =============================================================================
 # 6. TAX LOGIC (High value to keep clean)
 # =============================================================================
 
-def withhold_tax_on_profitable_sale(session: Session, investment_id: int,
-                                    sell_proceeds_usdc: float, wallet_pk: int) -> Result[bool]:
-    """
-    Automatically creates a Security(isTax=True) based on user's tax_level_choice.
-    This is business logic — keep it isolated.
-    """
-    pass
+def calculate_realized_gain(
+    session: Session,
+    investment_id: int,
+    sell_price_usdc: float
+) -> Result[dict]:
+    """Calculate profit/loss when closing an investment."""
+    try:
+        inv = session.execute(
+            select(Investment).where(Investment.id == investment_id)
+        ).scalar_one()
+
+        purchase_price = inv.purchase_price_usdc or 0.0
+        profit = sell_price_usdc - purchase_price
+
+        return Ok({
+            "profit_usdc": profit,
+            "is_profitable": profit > 0,
+            "purchase_price_usdc": purchase_price,
+            "sell_price_usdc": sell_price_usdc,
+        })
+    except Exception as e:
+        return Err(str(e))
+
+
+def withhold_tax_on_profitable_sale(
+    session: Session,
+    investment_id: int,
+    sell_proceeds_usdc: float,
+    wallet_pk: int
+) -> Result[bool]:
+    """Automatically withhold tax into a Security(isTax=True) on profitable sales."""
+    try:
+        gain_res = calculate_realized_gain(session, investment_id, sell_proceeds_usdc)
+        if gain_res.is_error:
+            return gain_res
+
+        gain = gain_res.value
+        if not gain["is_profitable"]:
+            return Ok(False)
+
+        # Get user's tax rate
+        wallet = session.execute(select(Wallet).where(Wallet.id == wallet_pk)).scalar_one()
+        user = session.execute(select(User).where(User.id == wallet.parent_id)).scalar_one()
+        tax_rate = user.tax_level_choice or 0.30
+
+        tax_amount = round(gain["profit_usdc"] * tax_rate, 2)
+        if tax_amount <= 0:
+            return Ok(False)
+
+        tax_sec = SecurityCreate(
+            amount=0,
+            purchase_price_usdc=tax_amount,
+            purchase_time_ms=int(time.time() * 1000),
+            buy_fee_native_lamports=0,
+            buy_fee_usdc=0,
+            buy_tx_id=f"tax_withhold_{investment_id}",
+            isTax=True,
+        )
+
+        stable_key = get_token_key(WORLD_STABLE_COIN).value
+        insert_res = insert_security(session, stable_key, tax_sec, wallet_id=wallet_pk)
+
+        if insert_res.is_error:
+            return insert_res
+
+        logging.info(f"✅ Tax withheld: ${tax_amount:.2f}")
+        return Ok(True)
+
+    except Exception as e:
+        session.rollback()
+        return Err(str(e))
 
 
 def get_total_tax_owed(session: Session, wallet_pk: int) -> Result[float]:
-    """Total USDC currently reserved for taxes."""
-    pass
+    """
+    Returns the total USDC value currently held in open tax securities
+    for this wallet.
+    """
+    try:
+        stmt = (
+            select(func.sum(Security.purchase_price_usdc))
+            .join(Asset, Security.parent_id == Asset.id)
+            .where(
+                Asset.wallet == wallet_pk,
+                Security.isTax == True,
+                Security.isClosed == False
+            )
+        )
+        total = session.execute(stmt).scalar()
+
+        # Handle case where there are no tax securities
+        if total is None:
+            total = 0.0
+
+        return Ok(float(total))
+
+    except Exception as e:
+        return Err(str(e))
 
 
 def get_open_tax_securities(session: Session, wallet_pk: int) -> Result[List[Security]]:
@@ -382,10 +529,11 @@ def get_open_tax_securities(session: Session, wallet_pk: int) -> Result[List[Sec
 # 7. HIGH-LEVEL TRADE EXECUTION (Orchestrator)
 # =============================================================================
 
+
 def execute_trade_with_gas(
     session: Session,
     investment_id: int,
-    jupiter_client,                    # Your Jupiter/Helius client (can be placeholder for now)
+    jupiter_client,                    # Will be replaced with Helius later
     target_mint: str,
     estimated_gas_lamports: int,
     wallet_pk: int,
@@ -393,63 +541,65 @@ def execute_trade_with_gas(
     gas_security_id: Optional[int] = None,
 ) -> Result[dict]:
     """
-    High-level orchestrator for executing a trade with safety, gas, and tax handling.
-
-    Flow:
-    1. Run pre-trade safety checks
-    2. Ensure sufficient gas
-    3. Execute Jupiter/Helius swap
-    4. Record the partial sell in DB
-    5. Spend gas from security
-    6. Automatically withhold tax on profitable trades
+    High-level trade orchestrator with safety rails, gas handling, and tax withholding.
     """
-    # === 1. SAFETY RAILS ===
-    inv = session.execute(
-        select(Investment).where(Investment.id == investment_id)
-    ).scalar_one_or_none()
+    logging.info(f"[TRADE] Starting trade for investment_id={investment_id}, wallet={wallet_pk}")
 
-    if not inv:
-        return Err("Investment does not exist")
+    # === 1. SAFETY CHECK ===
+    try:
+        inv = session.execute(
+            select(Investment).where(Investment.id == investment_id)
+        ).scalar_one_or_none()
 
-    sell_lamports = inv.amount // 2  # Currently sells half. Change this when needed.
+        if not inv:
+            return Err(f"Investment {investment_id} not found")
 
-    safety = pre_trade_safety_check(
-        session=session,
-        investment_id=investment_id,
-        sell_lamports=sell_lamports,
-        estimated_gas_lamports=estimated_gas_lamports,
-        wallet_pk=wallet_pk
-    )
-    if safety.is_error:
-        return Err(f"Safety check failed: {safety.error}")
+        sell_lamports = inv.amount // 2  # For now we sell half
 
-    # === 2. GAS CHECK ===
+        safety = pre_trade_safety_check(
+            session=session,
+            investment_id=investment_id,
+            sell_lamports=sell_lamports,
+            estimated_gas_lamports=estimated_gas_lamports,
+            wallet_pk=wallet_pk
+        )
+
+        if safety.is_error:
+            logging.error(f"[SAFETY] Trade blocked: {safety.error}")
+            return Err(f"Safety check failed: {safety.error}")
+
+        if safety.value.get("warnings"):
+            logging.warning(f"[SAFETY] Warnings: {safety.value['warnings']}")
+
+    except Exception as e:
+        logging.exception("[SAFETY] Unexpected error during safety check")
+        return Err(f"Safety check crashed: {str(e)}")
+
+    # === 2. GAS HANDLING ===
+    if gas_security_id is None:
+        oldest = get_oldest_gas_security(session, wallet_pk)
+        if oldest.is_ok and oldest.value:
+            gas_security_id = oldest.value
+            logging.info(f"[GAS] Auto-selected oldest gas security: {gas_security_id}")
+        else:
+            logging.warning("[GAS] No open gas security found")
+
     gas_check = ensure_sufficient_gas(session, estimated_gas_lamports, wallet_pk)
     if gas_check.is_error:
+        logging.error(f"[GAS] Insufficient gas: {gas_check.error}")
         return gas_check
 
-    # Auto-select oldest gas security if none provided
-    if gas_security_id is None:
-        oldest_res = get_oldest_gas_security(session, wallet_pk)
-        if oldest_res.is_ok and oldest_res.value:
-            gas_security_id = oldest_res.value
-            logging.info(f"Auto-selected oldest gas security: {gas_security_id}")
+    # === 3. EXECUTE SWAP (Placeholder for now) ===
+    logging.info("[SWAP] Executing swap via Jupiter/Helius (placeholder)...")
 
-    logging.info(f"[execute_trade_with_gas] Starting trade for investment {investment_id}")
-
-    # === 3. JUPITER / HELIUS SWAP ===
-    # TODO: Replace this section with real Helius/Jupiter integration
-    from_mint = WORLD_STABLE_COIN  # Define this constant somewhere (e.g. USDC mint)
-
-    # Placeholder quote + swap (replace with real call later)
-    # For now we simulate a successful swap
-    tx_sig = f"devnet_tx_{int(time.time())}"
-    received_amount = int(sell_lamports * 0.98)  # Fake 2% slippage
+    # TODO: Replace this section with real Helius or Jupiter call
+    tx_sig = "devnet_tx_" + str(int(time.time()))
+    received_amount = 1234567890   # placeholder
     sell_price_usdc = received_amount / 1_000_000
 
-    logging.info(f"[Jupiter/Helius] Simulated swap. Tx: {tx_sig}")
+    logging.info(f"[SWAP] Swap completed. tx={tx_sig}, received={received_amount}")
 
-    # === 4. RECORD THE PARTIAL SELL ===
+    # === 4. RECORD TRADE ===
     record_res = record_partial_sell(
         session=session,
         investment_id=investment_id,
@@ -458,6 +608,7 @@ def execute_trade_with_gas(
         sell_price_usdc=sell_price_usdc,
     )
     if record_res.is_error:
+        logging.error(f"[RECORD] Failed to record partial sell: {record_res.error}")
         return record_res
 
     # === 5. SPEND GAS ===
@@ -466,12 +617,12 @@ def execute_trade_with_gas(
             session=session,
             gas_security_id=gas_security_id,
             used_lamports=estimated_gas_lamports,
-            tx_id=f"gas_{tx_sig[:8]}"
+            tx_id="gas_" + tx_sig[:8]
         )
         if spend_res.is_error:
-            logging.warning(f"Gas spend warning: {spend_res.error}")
+            logging.warning(f"[GAS] Failed to spend gas security: {spend_res.error}")
 
-    # === 6. AUTOMATIC TAX WITHHOLDING ===
+    # === 6. WITHHOLD TAX ===
     tax_res = withhold_tax_on_profitable_sale(
         session=session,
         investment_id=investment_id,
@@ -479,16 +630,17 @@ def execute_trade_with_gas(
         wallet_pk=wallet_pk
     )
     if tax_res.is_error:
-        logging.warning(f"Tax withholding warning: {tax_res.error}")
+        logging.warning(f"[TAX] Tax withholding failed: {tax_res.error}")
+
+    logging.info(f"[TRADE] Trade completed successfully for investment {investment_id}")
 
     return Ok({
         "status": "success",
         "investment_id": investment_id,
-        "sold_lamports": sell_lamports,
         "tx_signature": tx_sig,
-        "received_amount_lamports": received_amount,
+        "sold_lamports": sell_lamports,
+        "received_amount": received_amount,
         "sell_price_usdc": sell_price_usdc,
-        "gas_used_lamports": estimated_gas_lamports,
         "gas_security_id": gas_security_id,
         "tax_withheld": tax_res.value if tax_res.is_ok else False,
     })
@@ -558,45 +710,48 @@ def pre_trade_safety_check(
 def get_wallet_summary(session: Session, wallet_pk: int) -> Result[dict]:
     """
     Returns a high-level summary of the wallet for auditing and monitoring.
-    Useful before making trades to understand current state.
+    More defensive version with better error handling.
     """
     try:
         # 1. Count open investments
-        open_investments_stmt = select(func.count()).select_from(Investment).join(Asset).where(
-            Asset.wallet == wallet_pk,
-            Investment.isClosed == False
+        open_inv_stmt = (
+            select(func.count())
+            .select_from(Investment)
+            .join(Asset, Investment.parent_id == Asset.id)
+            .where(Asset.wallet == wallet_pk, Investment.isClosed == False)
         )
-        open_investments = session.execute(open_investments_stmt).scalar() or 0
+        open_investments = session.execute(open_inv_stmt).scalar() or 0
 
-        # 2. Total tax reserved
+        # 2. Total tax reserved (USDC)
         tax_res = get_total_tax_owed(session, wallet_pk)
         total_tax_reserved = tax_res.value if tax_res.is_ok else 0.0
 
-        # 3. Total gas available (in lamports)
+        # 3. Total gas available (lamports + SOL)
         gas_res = get_available_gas_lamports(session, wallet_pk)
         total_gas_lamports = gas_res.value if gas_res.is_ok else 0
 
         # 4. Total value in open investments (purchase price in USDC)
-        investment_value_stmt = select(func.sum(Investment.purchase_price_usdc)).join(Asset).where(
-            Asset.wallet == wallet_pk,
-            Investment.isClosed == False
+        inv_value_stmt = (
+            select(func.sum(Investment.purchase_price_usdc))
+            .join(Asset, Investment.parent_id == Asset.id)
+            .where(Asset.wallet == wallet_pk, Investment.isClosed == False)
         )
-        total_investment_value_usdc = session.execute(investment_value_stmt).scalar() or 0.0
+        total_investment_value = session.execute(inv_value_stmt).scalar() or 0.0
 
         summary = {
             "wallet_id": wallet_pk,
-            "open_investments": open_investments,
-            "total_investment_value_usdc": round(total_investment_value_usdc, 2),
+            "open_investments_count": open_investments,
+            "total_investment_value_usdc": round(total_investment_value, 2),
             "total_tax_reserved_usdc": round(total_tax_reserved, 2),
-            "total_gas_available_lamports": total_gas_lamports,
-            "total_gas_available_sol": round(total_gas_lamports / 1_000_000_000, 6),
-            "timestamp": int(time.time())
+            "total_gas_lamports": total_gas_lamports,
+            "total_gas_sol": round(total_gas_lamports / 1_000_000_000, 6),
+            "timestamp": int(time.time()),
         }
 
         return Ok(summary)
 
     except Exception as e:
-        return Err(str(e))
+        return Err(f"Failed to build wallet summary: {str(e)}")
 
 
 
