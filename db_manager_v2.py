@@ -30,9 +30,13 @@ import os
 from dotenv import load_dotenv
 import requests
 
+from logging_config import setup_logging
+
 Base = declarative_base()
 
 load_dotenv()
+
+setup_logging(log_file="trades.log")
 
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 
