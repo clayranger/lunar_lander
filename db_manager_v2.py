@@ -1152,19 +1152,27 @@ def execute_sell_percentage_investment(
     sell_percentage: float = 50.0,
     estimated_gas_lamports: int = 5_000_000,
     wallet_pk: int = None,
+    keypair_path: str = "~/.config/solana/mainnet-test.json",
 ) -> Result[dict]:
     """
-    Sells a specific percentage of an investment using the full trade flow.
-    Example: sell_percentage=50 sells half, sell_percentage=100 sells everything.
+    Sells a specific percentage of an investment on mainnet.
+
+    Example usage:
+        result = execute_sell_percentage_investment(
+            session=session,
+            investment_id=10,
+            target_mint="So11111111111111111111111111111111111111112",
+            sell_percentage=25,           # Sell 25%
+        )
     """
     if wallet_pk is None:
         single = get_single_wallet_pk(session)
         if single.is_ok and single.value:
             wallet_pk = single.value
         else:
-            return Err("wallet_pk not provided and no default wallet found")
+            return Err("wallet_pk not provided and no default wallet could be determined")
 
-    # Load the investment to calculate sell amount
+    # Load the investment to calculate how much to sell
     inv = session.execute(
         select(Investment).where(Investment.id == investment_id)
     ).scalar_one_or_none()
@@ -1181,7 +1189,7 @@ def execute_sell_percentage_investment(
     sell_lamports = int(inv.amount * (sell_percentage / 100))
 
     if sell_lamports <= 0:
-        return Err("Calculated sell amount is zero")
+        return Err("Calculated sell amount is zero or negative")
 
     return execute_trade_with_gas(
         session=session,
@@ -1190,7 +1198,6 @@ def execute_sell_percentage_investment(
         estimated_gas_lamports=estimated_gas_lamports,
         wallet_pk=wallet_pk,
         sell_lamports=sell_lamports,
+        keypair_path=keypair_path,
     )
-
-
 
