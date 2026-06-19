@@ -454,3 +454,43 @@ def get_wallet_summary(session: Session, wallet_pk: int) -> Result[dict]:
 
     except Exception as e:
         return Err(str(e))
+
+
+
+# ============================ OPEN INVESTMENTS ============================
+
+def get_open_investments(session: Session, wallet_pk: int) -> Result[List[dict]]:
+    """
+    Returns a list of currently open investments for the wallet.
+    Useful for reviewing positions before trading.
+    """
+    try:
+        stmt = (
+            select(Investment)
+            .join(Asset, Investment.parent_id == Asset.id)
+            .where(
+                Asset.wallet == wallet_pk,
+                Investment.isClosed == False
+            )
+            .order_by(Investment.purchase_time_ms.desc())
+        )
+
+        investments = session.execute(stmt).scalars().all()
+
+        result = []
+        for inv in investments:
+            result.append({
+                "investment_id": inv.id,
+                "amount_lamports": inv.amount,
+                "purchase_price_usdc": inv.purchase_price_usdc,
+                "purchase_time_ms": inv.purchase_time_ms,
+                "buy_tx_id": inv.buy_tx_id,
+            })
+
+        return Ok(result)
+
+    except Exception as e:
+        return Err(str(e))
+
+
+
