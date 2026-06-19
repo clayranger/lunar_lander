@@ -30,6 +30,9 @@ import os
 from dotenv import load_dotenv
 import requests
 
+from solana.rpc.api import Client
+from solana.rpc.commitment import Commitment
+
 from logging_config import setup_logging
 
 Base = declarative_base()
@@ -536,205 +539,169 @@ def get_open_tax_securities(session: Session, wallet_pk: int) -> Result[List[Sec
 
 
 
+
+
 def execute_trade_with_gas(
     session: Session,
     investment_id: int,
     target_mint: str,
     estimated_gas_lamports: int,
     wallet_pk: int,
+    sell_lamports: int = None,
     gas_security_id: Optional[int] = None,
-    helius_api_key: str = None,
-    wallet_public_key: str = None,
+    max_retries: int = 3,
 ) -> Result[dict]:
     """
     High-level trade orchestrator using Helius for Jupiter swaps.
-    Includes safety checks, gas handling, tax withholding, and result logging.
+    Includes safety rails, gas handling, tax withholding, retry logic,
+    and synchronous transaction confirmation.
     """
-    logging.info(f"[TRADE] Starting trade for investment_id={investment_id}")
+    logging.info(f"[TRADE] Starting trade | investment_id={investment_id} | wallet={wallet_pk}")
 
-    # Load from environment variables if not passed explicitly
-    helius_api_key = helius_api_key or os.getenv("HELIUS_API_KEY")
-    wallet_public_key = wallet_public_key or os.getenv("WALLET_PUBLIC_KEY")
+    helius_api_key = os.getenv("HELIUS_API_KEY")
+    wallet_public_key = os.getenv("WALLET_PUBLIC_KEY")
 
     if not helius_api_key or not wallet_public_key:
-        return Err("Missing HELIUS_API_KEY or WALLET_PUBLIC_KEY in environment variables")
+        return Err("Missing HELIUS_API_KEY or WALLET_PUBLIC_KEY environment variables")
 
-    try:
-        # === 1. Load Investment & Safety Check ===
-        inv = session.execute(
-            select(Investment).where(Investment.id == investment_id)
-        ).scalar_one_or_none()
+    for attempt in range(1, max_retries + 1):
+        try:
+            # === 1. Load Investment ===
+            inv = session.execute(
+                select(Investment).where(Investment.id == investment_id)
+            ).scalar_one_or_none()
 
-        if not inv:
-            log_trade_result(investment_id, wallet_pk, status="failed", error_message="Investment not found")
-            return Err("Investment not found")
+            if not inv:
+                log_trade_result(investment_id, wallet_pk, status="failed", error_message="Investment not found")
+                return Err("Investment not found")
 
-        sell_lamports = inv.amount // 2
+            if sell_lamports is None:
+                sell_lamports = inv.amount // 2
 
-        safety = pre_trade_safety_check(
-            session=session,
-            investment_id=investment_id,
-            sell_lamports=sell_lamports,
-            estimated_gas_lamports=estimated_gas_lamports,
-            wallet_pk=wallet_pk
-        )
-        if safety.is_error:
-            log_trade_result(investment_id, wallet_pk, status="failed", error_message=safety.error)
-            return Err(f"Safety check failed: {safety.error}")
+            if sell_lamports <= 0 or sell_lamports > inv.amount:
+                return Err("Invalid sell amount")
 
-        # === 2. Gas Check ===
-        if gas_security_id is None:
-            oldest = get_oldest_gas_security(session, wallet_pk)
-            if oldest.is_ok and oldest.value:
-                gas_security_id = oldest.value
-
-        gas_check = ensure_sufficient_gas(session, estimated_gas_lamports, wallet_pk)
-        if gas_check.is_error:
-            log_trade_result(investment_id, wallet_pk, status="failed", error_message=gas_check.error)
-            return gas_check
-
-        # === 3. Execute Swap via Helius ===
-        logging.info("[SWAP] Calling Helius Jupiter Swap...")
-
-        swap_res = execute_jupiter_swap_via_helius(
-            input_mint=WORLD_STABLE_COIN,      # e.g. USDC
-            output_mint=target_mint,
-            amount=sell_lamports,
-            slippage_bps=50,
-            helius_api_key=helius_api_key,
-            wallet_public_key=wallet_public_key,
-        )
-
-        if swap_res.is_error:
-            log_trade_result(investment_id, wallet_pk, status="failed", error_message=swap_res.error)
-            return Err(f"Helius swap failed: {swap_res.error}")
-
-        tx_sig = swap_res.value["signature"]
-        received_amount = swap_res.value.get("received_amount", 0)  # Update if Helius returns this
-        sell_price_usdc = received_amount / 1_000_000 if received_amount else 0.0
-
-        logging.info(f"[SWAP] Success | tx={tx_sig}")
-
-        # === 4. Record Partial Sell ===
-        record_res = record_partial_sell(
-            session=session,
-            investment_id=investment_id,
-            sold_lamports=sell_lamports,
-            sell_tx_id=tx_sig,
-            sell_price_usdc=sell_price_usdc,
-        )
-        if record_res.is_error:
-            log_trade_result(investment_id, wallet_pk, status="failed", error_message=record_res.error)
-            return record_res
-
-        # === 5. Spend Gas ===
-        if gas_security_id:
-            spend_res = spend_gas_security(
+            # === 2. Safety Check ===
+            safety = pre_trade_safety_check(
                 session=session,
-                gas_security_id=gas_security_id,
-                used_lamports=estimated_gas_lamports,
-                tx_id="gas_" + tx_sig[:8]
+                investment_id=investment_id,
+                sell_lamports=sell_lamports,
+                estimated_gas_lamports=estimated_gas_lamports,
+                wallet_pk=wallet_pk
             )
-            if spend_res.is_error:
-                logging.warning(f"[GAS] Could not spend gas security: {spend_res.error}")
+            if safety.is_error:
+                log_trade_result(investment_id, wallet_pk, status="failed", error_message=safety.error)
+                return Err(f"Safety check failed: {safety.error}")
 
-        # === 6. Withhold Tax ===
-        tax_res = withhold_tax_on_profitable_sale(
-            session=session,
-            investment_id=investment_id,
-            sell_proceeds_usdc=sell_price_usdc,
-            wallet_pk=wallet_pk
-        )
-        if tax_res.is_error:
-            logging.warning(f"[TAX] Tax withholding failed: {tax_res.error}")
+            # === 3. Gas Preparation ===
+            if gas_security_id is None:
+                oldest = get_oldest_gas_security(session, wallet_pk)
+                if oldest.is_ok and oldest.value:
+                    gas_security_id = oldest.value
 
-        # === 7. Log Success ===
-        log_trade_result(
-            investment_id=investment_id,
-            wallet_pk=wallet_pk,
-            status="success",
-            tx_signature=tx_sig,
-            sold_lamports=sell_lamports,
-            received_amount=received_amount,
-            sell_price_usdc=sell_price_usdc,
-        )
+            gas_check = ensure_sufficient_gas(session, estimated_gas_lamports, wallet_pk)
+            if gas_check.is_error:
+                log_trade_result(investment_id, wallet_pk, status="failed", error_message=gas_check.error)
+                return gas_check
 
-        logging.info(f"[TRADE] Completed successfully | investment_id={investment_id}")
+            # === 4. Execute Swap via Helius ===
+            logging.info(f"[SWAP] Attempt {attempt}/{max_retries} via Helius...")
 
-        return Ok({
-            "status": "success",
-            "investment_id": investment_id,
-            "tx_signature": tx_sig,
-            "sold_lamports": sell_lamports,
-            "received_amount": received_amount,
-            "sell_price_usdc": sell_price_usdc,
-            "gas_security_id": gas_security_id,
-            "tax_withheld": tax_res.value if tax_res.is_ok else False,
-        })
+            swap_res = execute_jupiter_swap_via_helius(
+                input_mint=WORLD_STABLE_COIN,
+                output_mint=target_mint,
+                amount=sell_lamports,
+                slippage_bps=50,
+                helius_api_key=helius_api_key,
+                wallet_public_key=wallet_public_key,
+            )
 
-    except Exception as e:
-        logging.exception("[TRADE] Unexpected error")
-        log_trade_result(investment_id, wallet_pk, status="failed", error_message=str(e))
-        return Err(f"Unexpected error during trade: {str(e)}")
+            if swap_res.is_error:
+                if attempt == max_retries:
+                    log_trade_result(investment_id, wallet_pk, status="failed", error_message=swap_res.error)
+                    return Err(f"Helius swap failed after {max_retries} attempts")
+                logging.warning(f"[SWAP] Attempt {attempt} failed. Retrying...")
+                time.sleep(2)
+                continue
 
+            tx_sig = swap_res.value["signature"]
 
-# ============================ SAFETY RAILS ============================
+            # === 5. Confirm Transaction (Synchronous) ===
+            confirm_res = confirm_transaction(tx_sig)
+            if confirm_res.is_error:
+                log_trade_result(investment_id, wallet_pk, status="failed", error_message=confirm_res.error)
+                return Err(f"Transaction confirmation failed: {confirm_res.error}")
 
-def pre_trade_safety_check(
-    session: Session,
-    investment_id: int,
-    sell_lamports: int,
-    estimated_gas_lamports: int,
-    wallet_pk: int
-) -> Result[dict]:
-    """
-    Runs multiple safety checks before executing a trade.
-    Returns detailed status so we can decide whether to proceed.
-    """
-    issues = []
-    warnings = []
+            logging.info(f"[CONFIRM] Transaction confirmed: {tx_sig}")
 
-    try:
-        # 1. Check investment exists and is open
-        inv = session.execute(
-            select(Investment).where(Investment.id == investment_id)
-        ).scalar_one_or_none()
+            received_amount = swap_res.value.get("received_amount", 0)
+            sell_price_usdc = received_amount / 1_000_000 if received_amount else 0.0
 
-        if not inv:
-            issues.append("Investment does not exist")
-        elif inv.isClosed:
-            issues.append("Investment is already closed")
-        elif sell_lamports > inv.amount:
-            issues.append(f"Trying to sell more lamports ({sell_lamports}) than available ({inv.amount})")
+            # === 6. Record Partial Sell ===
+            record_res = record_partial_sell(
+                session=session,
+                investment_id=investment_id,
+                sold_lamports=sell_lamports,
+                sell_tx_id=tx_sig,
+                sell_price_usdc=sell_price_usdc,
+            )
+            if record_res.is_error:
+                log_trade_result(investment_id, wallet_pk, status="failed", error_message=record_res.error)
+                return record_res
 
-        # 2. Gas check
-        gas_res = ensure_sufficient_gas(session, estimated_gas_lamports, wallet_pk)
-        if gas_res.is_error:
-            issues.append(gas_res.error)
+            # === 7. Spend Gas ===
+            if gas_security_id:
+                spend_res = spend_gas_security(
+                    session=session,
+                    gas_security_id=gas_security_id,
+                    used_lamports=estimated_gas_lamports,
+                    tx_id="gas_" + tx_sig[:8]
+                )
+                if spend_res.is_error:
+                    logging.warning(f"[GAS] Could not spend gas security: {spend_res.error}")
 
-        # 3. Basic tax readiness check
-        wallet = session.execute(select(Wallet).where(Wallet.id == wallet_pk)).scalar_one_or_none()
-        if wallet:
-            user = session.execute(select(User).where(User.id == wallet.parent_id)).scalar_one_or_none()
-            if user and (user.tax_level_choice is None or user.tax_level_choice <= 0):
-                warnings.append("User tax_level_choice is not set or is zero — tax will not be withheld on profits")
+            # === 8. Withhold Tax ===
+            tax_res = withhold_tax_on_profitable_sale(
+                session=session,
+                investment_id=investment_id,
+                sell_proceeds_usdc=sell_price_usdc,
+                wallet_pk=wallet_pk
+            )
+            if tax_res.is_error:
+                logging.warning(f"[TAX] Tax withholding failed: {tax_res.error}")
 
-        if issues:
-            return Err({
-                "status": "blocked",
-                "issues": issues,
-                "warnings": warnings
+            # === 9. Log Success ===
+            log_trade_result(
+                investment_id=investment_id,
+                wallet_pk=wallet_pk,
+                status="success",
+                tx_signature=tx_sig,
+                sold_lamports=sell_lamports,
+                received_amount=received_amount,
+                sell_price_usdc=sell_price_usdc,
+            )
+
+            logging.info(f"[TRADE] Completed successfully | investment_id={investment_id}")
+
+            return Ok({
+                "status": "success",
+                "investment_id": investment_id,
+                "tx_signature": tx_sig,
+                "sold_lamports": sell_lamports,
+                "received_amount": received_amount,
+                "sell_price_usdc": sell_price_usdc,
+                "gas_security_id": gas_security_id,
+                "tax_withheld": tax_res.value if tax_res.is_ok else False,
             })
 
-        return Ok({
-            "status": "ok",
-            "warnings": warnings,
-            "checks_passed": ["investment_open", "sufficient_gas"]
-        })
+        except Exception as e:
+            logging.exception(f"[TRADE] Unexpected error on attempt {attempt}")
+            if attempt == max_retries:
+                log_trade_result(investment_id, wallet_pk, status="failed", error_message=str(e))
+                return Err(f"Trade failed after {max_retries} attempts: {str(e)}")
+            time.sleep(2)
 
-    except Exception as e:
-        return Err({"status": "error", "message": str(e)})
-
+    return Err(f"Trade failed after {max_retries} attempts")
 
 
 # ============================ AUDIT / WALLET SUMMARY ============================
@@ -976,3 +943,124 @@ def log_trade_result(
         logging.info(f"[TRADE] {log_entry}")
     else:
         logging.error(f"[TRADE] {log_entry}")
+
+
+def confirm_transaction(
+    tx_signature: str,
+    rpc_url: str = "https://api.devnet.solana.com",
+    max_retries: int = 30,
+    sleep_seconds: float = 2.0
+) -> Result[dict]:
+    """
+    Waits for a transaction to be confirmed on-chain.
+    Returns transaction status once confirmed or fails after max retries.
+    """
+    client = Client(rpc_url)
+
+    for attempt in range(max_retries):
+        try:
+            response = client.get_transaction(
+                tx_signature,
+                commitment=Commitment("confirmed"),
+                max_supported_transaction_version=0
+            )
+
+            if response.value:
+                meta = response.value.transaction.meta
+                if meta and meta.err is None:
+                    logging.info(f"[CONFIRM] Transaction confirmed: {tx_signature}")
+                    return Ok({
+                        "signature": tx_signature,
+                        "status": "confirmed",
+                        "slot": response.value.slot,
+                    })
+                else:
+                    return Err(f"Transaction failed on-chain: {meta.err if meta else 'Unknown error'}")
+
+            logging.info(f"[CONFIRM] Attempt {attempt + 1}/{max_retries} - not confirmed yet...")
+            time.sleep(sleep_seconds)
+
+        except Exception as e:
+            logging.warning(f"[CONFIRM] Error checking transaction: {str(e)}")
+            time.sleep(sleep_seconds)
+
+    return Err(f"Transaction not confirmed after {max_retries} attempts")
+
+
+
+def execute_sell_half_investment(
+    session,
+    investment_id: int,
+    target_mint: str,
+    estimated_gas_lamports: int = 5_000_000,
+    wallet_pk: int = None,
+) -> Result[dict]:
+    """
+    Easy helper function for testing.
+    Sells half of an investment using Helius + all safety rails.
+
+    Usage in notebook:
+        result = execute_sell_half_investment(session, investment_id=42, target_mint="So1111...")
+    """
+    if wallet_pk is None:
+        # Try to get the single wallet if only one exists
+        single_wallet = get_single_wallet_pk(session)
+        if single_wallet.is_ok and single_wallet.value:
+            wallet_pk = single_wallet.value
+        else:
+            return Err("wallet_pk not provided and could not determine default wallet")
+
+    return execute_trade_with_gas(
+        session=session,
+        investment_id=investment_id,
+        target_mint=target_mint,
+        estimated_gas_lamports=estimated_gas_lamports,
+        wallet_pk=wallet_pk,
+    )
+
+
+def execute_sell_percentage_investment(
+    session,
+    investment_id: int,
+    target_mint: str,
+    sell_percentage: float = 50.0,           # e.g. 25, 50, 75, 100
+    estimated_gas_lamports: int = 5_000_000,
+    wallet_pk: int = None,
+) -> Result[dict]:
+    """
+    Sells a specific percentage of an investment.
+
+    Example:
+        execute_sell_percentage_investment(session, investment_id=42, target_mint=..., sell_percentage=50)
+    """
+    if wallet_pk is None:
+        single = get_single_wallet_pk(session)
+        if single.is_ok and single.value:
+            wallet_pk = single.value
+        else:
+            return Err("Could not determine wallet_pk")
+
+    # Get the investment to calculate sell amount
+    inv = session.execute(
+        select(Investment).where(Investment.id == investment_id)
+    ).scalar_one_or_none()
+
+    if not inv:
+        return Err(f"Investment {investment_id} not found")
+
+    if inv.isClosed:
+        return Err(f"Investment {investment_id} is already closed")
+
+    sell_lamports = int(inv.amount * (sell_percentage / 100))
+
+    if sell_lamports <= 0:
+        return Err("Calculated sell amount is zero")
+
+    return execute_trade_with_gas(
+        session=session,
+        investment_id=investment_id,
+        target_mint=target_mint,
+        estimated_gas_lamports=estimated_gas_lamports,
+        wallet_pk=wallet_pk,
+        sell_lamports=sell_lamports,
+    )
