@@ -716,3 +716,13 @@ def get_single_wallet_pk(session: Session) -> Result[Optional[int]]:
         return Ok(None)
     except Exception as e:
         return Err(str(e))
+
+
+def get_wallet_id_by_public_key(db_session: Session, public_key: str) -> Optional[int]:
+    """Get wallet primary key from a public key string."""
+    try:
+        stmt = select(Wallet.id).where(Wallet.publicKey == public_key)
+        return db_session.execute(stmt).scalar()
+    except Exception as e:
+        logging.error(f"[get_wallet_id_by_public_key] {e}")
+        return None
