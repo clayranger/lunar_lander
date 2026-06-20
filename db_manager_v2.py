@@ -1170,8 +1170,8 @@ def sync_wallet_balances(
     wallet_public_key: str = None,
 ) -> Result[dict]:
     """
-    Minimal version: Only syncs SOL balance for now.
-    (SPL token syncing disabled until token setup is fixed)
+    Read-only version for development.
+    Only reads SOL balance. Does not create any Asset records.
     """
     if rpc_url is None:
         helius_key = os.getenv("HELIUS_API_KEY")
@@ -1187,36 +1187,74 @@ def sync_wallet_balances(
     owner = Pubkey.from_string(wallet_public_key)
 
     try:
-        # Only sync SOL for now
         sol_balance = client.get_balance(owner).value
-        sol_mint = "So11111111111111111111111111111111111111112"
+        logging.info(f"[SYNC] Wallet {wallet_pk} SOL balance = {sol_balance} lamports (read-only)")
 
-        sol_asset = session.execute(
-            select(Asset).where(Asset.wallet == wallet_pk, Asset.coin == sol_mint.encode())
-        ).scalar_one_or_none()
-
-        if sol_asset:
-            if sol_asset.audited_amount_sum_lamports != sol_balance:
-                sol_asset.audited_amount_sum_lamports = sol_balance
-                sol_asset.audited_time_unix_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        else:
-            new_asset = Asset(
-                wallet=wallet_pk,
-                coin=sol_mint.encode(),
-                audited_amount_sum_lamports=sol_balance,
-                audited_time_unix_ms=int(datetime.now(timezone.utc).timestamp() * 1000),
-                isNative=True,
-            )
-            session.add(new_asset)
-
-        session.commit()
-        logging.info(f"[SYNC] SOL balance synced for wallet {wallet_pk}")
-        return Ok({"status": "success", "sol_balance": sol_balance})
+        return Ok({
+            "status": "read_only",
+            "sol_balance_lamports": sol_balance,
+            "message": "Asset creation disabled until token setup is stable"
+        })
 
     except Exception as e:
-        session.rollback()
-        logging.error(f"[SYNC] Failed to sync wallet {wallet_pk}: {str(e)}")
+        logging.error(f"[SYNC] Failed to read balance for wallet {wallet_pk}: {str(e)}")
         return Err(str(e))
+
+
+# def sync_wallet_balances(
+#     session: Session,
+#     wallet_pk: int,
+#     rpc_url: str = None,
+#     wallet_public_key: str = None,
+# ) -> Result[dict]:
+#     """
+#     Minimal version: Only syncs SOL balance for now.
+#     (SPL token syncing disabled until token setup is fixed)
+#     """
+#     if rpc_url is None:
+#         helius_key = os.getenv("HELIUS_API_KEY")
+#         rpc_url = f"https://mainnet.helius-rpc.com/?api-key={helius_key}"
+#
+#     if wallet_public_key is None:
+#         wallet = session.execute(select(Wallet).where(Wallet.id == wallet_pk)).scalar_one_or_none()
+#         if not wallet:
+#             return Err("Wallet not found")
+#         wallet_public_key = wallet.publicKey
+#
+#     client = Client(rpc_url)
+#     owner = Pubkey.from_string(wallet_public_key)
+#
+#     try:
+#         # Only sync SOL for now
+#         sol_balance = client.get_balance(owner).value
+#         sol_mint = "So11111111111111111111111111111111111111112"
+#
+#         sol_asset = session.execute(
+#             select(Asset).where(Asset.wallet == wallet_pk, Asset.coin == sol_mint.encode())
+#         ).scalar_one_or_none()
+#
+#         if sol_asset:
+#             if sol_asset.audited_amount_sum_lamports != sol_balance:
+#                 sol_asset.audited_amount_sum_lamports = sol_balance
+#                 sol_asset.audited_time_unix_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+#         else:
+#             new_asset = Asset(
+#                 wallet=wallet_pk,
+#                 coin=sol_mint.encode(),
+#                 audited_amount_sum_lamports=sol_balance,
+#                 audited_time_unix_ms=int(datetime.now(timezone.utc).timestamp() * 1000),
+#                 isNative=True,
+#             )
+#             session.add(new_asset)
+#
+#         session.commit()
+#         logging.info(f"[SYNC] SOL balance synced for wallet {wallet_pk}")
+#         return Ok({"status": "success", "sol_balance": sol_balance})
+#
+#     except Exception as e:
+#         session.rollback()
+#         logging.error(f"[SYNC] Failed to sync wallet {wallet_pk}: {str(e)}")
+#         return Err(str(e))
 
 # def sync_wallet_balances(
 #     session: Session,
