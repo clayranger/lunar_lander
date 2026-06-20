@@ -1201,3 +1201,123 @@ def execute_sell_percentage_investment(
         keypair_path=keypair_path,
     )
 
+
+
+
+def sync_wallet_balances(
+    session: Session,
+    wallet_pk: int,
+    rpc_url: str = None,
+    wallet_public_key: str = None,
+) -> Result[dict]:
+    """
+    Syncs on-chain balances (SOL + SPL tokens) into the Asset table.
+    Idempotent: only updates if the on-chain amount differs from the database.
+    """
+    if rpc_url is None:
+        helius_key = os.getenv("HELIUS_API_KEY")
+        rpc_url = f"https://mainnet.helius-rpc.com/?api-key={helius_key}"
+
+    if wallet_public_key is None:
+        # Try to get public key from Wallet table
+        wallet = session.execute(
+            select(Wallet).where(Wallet.id == wallet_pk)
+        ).scalar_one_or_none()
+        if not wallet:
+            return Err("Wallet not found")
+        wallet_public_key = wallet.publicKey
+
+    client = Client(rpc_url)
+    owner = Pubkey.from_string(wallet_public_key)
+
+    created = 0
+    updated = 0
+    unchanged = 0
+
+    try:
+        # 1. Get SOL balance
+        sol_balance = client.get_balance(owner).value
+        sol_mint = "So11111111111111111111111111111111111111112"  # Wrapped SOL mint
+
+        sol_asset = session.execute(
+            select(Asset).where(
+                Asset.wallet == wallet_pk,
+                Asset.coin == sol_mint.encode()  # You may need to adjust storage
+            )
+        ).scalar_one_or_none()
+
+        if sol_asset:
+            if sol_asset.audited_amount_sum_lamports != sol_balance:
+                sol_asset.audited_amount_sum_lamports = sol_balance
+                sol_asset.audited_time_unix_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                updated += 1
+                logging.info(f"[SYNC] Updated SOL balance for wallet {wallet_pk}")
+            else:
+                unchanged += 1
+        else:
+            # Create new Asset for SOL
+            new_asset = Asset(
+                wallet=wallet_pk,
+                coin=sol_mint.encode(),
+                audited_amount_sum_lamports=sol_balance,
+                audited_time_unix_ms=int(datetime.now(timezone.utc).timestamp() * 1000),
+                isNative=True,
+            )
+            session.add(new_asset)
+            created += 1
+            logging.info(f"[SYNC] Created SOL asset for wallet {wallet_pk}")
+
+        # 2. Get all SPL token accounts
+        token_accounts = client.get_token_accounts_by_owner(
+            owner,
+            opts={"program_id": Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")}
+        ).value
+
+        for account in token_accounts:
+            mint = str(account.account.data.parsed["info"]["mint"])
+            amount = int(account.account.data.parsed["info"]["tokenAmount"]["amount"])
+
+            asset = session.execute(
+                select(Asset).where(
+                    Asset.wallet == wallet_pk,
+                    Asset.coin == mint.encode()
+                )
+            ).scalar_one_or_none()
+
+            if asset:
+                if asset.audited_amount_sum_lamports != amount:
+                    asset.audited_amount_sum_lamports = amount
+                    asset.audited_time_unix_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                    updated += 1
+                    logging.info(f"[SYNC] Updated token {mint} for wallet {wallet_pk}")
+                else:
+                    unchanged += 1
+            else:
+                new_asset = Asset(
+                    wallet=wallet_pk,
+                    coin=mint.encode(),
+                    audited_amount_sum_lamports=amount,
+                    audited_time_unix_ms=int(datetime.now(timezone.utc).timestamp() * 1000),
+                    isNative=False,
+                )
+                session.add(new_asset)
+                created += 1
+                logging.info(f"[SYNC] Created new asset for token {mint} (wallet {wallet_pk})")
+
+        session.commit()
+
+        summary = {
+            "created_assets": created,
+            "updated_assets": updated,
+            "unchanged_assets": unchanged,
+            "total_assets": created + updated + unchanged,
+        }
+
+        logging.info(f"[SYNC] Wallet {wallet_pk} sync complete: {summary}")
+        return Ok(summary)
+
+    except Exception as e:
+        session.rollback()
+        logging.error(f"[SYNC] Failed to sync wallet {wallet_pk}: {str(e)}")
+        return Err(str(e))
+
