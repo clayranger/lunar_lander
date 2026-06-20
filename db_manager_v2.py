@@ -36,13 +36,17 @@ from solana.rpc.commitment import Commitment
 
 from logging_config import setup_logging
 
-from solders.keypair import Keypair
-from solders.transaction import VersionedTransaction
 from solders.message import to_bytes_versioned
 import json
 
+from solders.keypair import Keypair
+from solders.transaction import VersionedTransaction
+from solders.pubkey import Pubkey          # ← Add this line
 
+from solana.rpc.api import Client
+from solana.rpc.commitment import Commitment
 
+from datetime import datetime, timezone
 Base = declarative_base()
 
 load_dotenv()
@@ -1159,8 +1163,6 @@ def execute_sell_percentage_investment(
     )
 
 
-
-
 def sync_wallet_balances(
     session: Session,
     wallet_pk: int,
@@ -1168,18 +1170,15 @@ def sync_wallet_balances(
     wallet_public_key: str = None,
 ) -> Result[dict]:
     """
-    Syncs on-chain balances (SOL + SPL tokens) into the Asset table.
-    Idempotent: only updates if the on-chain amount differs from the database.
+    Minimal version: Only syncs SOL balance for now.
+    (SPL token syncing disabled until token setup is fixed)
     """
     if rpc_url is None:
         helius_key = os.getenv("HELIUS_API_KEY")
         rpc_url = f"https://mainnet.helius-rpc.com/?api-key={helius_key}"
 
     if wallet_public_key is None:
-        # Try to get public key from Wallet table
-        wallet = session.execute(
-            select(Wallet).where(Wallet.id == wallet_pk)
-        ).scalar_one_or_none()
+        wallet = session.execute(select(Wallet).where(Wallet.id == wallet_pk)).scalar_one_or_none()
         if not wallet:
             return Err("Wallet not found")
         wallet_public_key = wallet.publicKey
@@ -1187,32 +1186,20 @@ def sync_wallet_balances(
     client = Client(rpc_url)
     owner = Pubkey.from_string(wallet_public_key)
 
-    created = 0
-    updated = 0
-    unchanged = 0
-
     try:
-        # 1. Get SOL balance
+        # Only sync SOL for now
         sol_balance = client.get_balance(owner).value
-        sol_mint = "So11111111111111111111111111111111111111112"  # Wrapped SOL mint
+        sol_mint = "So11111111111111111111111111111111111111112"
 
         sol_asset = session.execute(
-            select(Asset).where(
-                Asset.wallet == wallet_pk,
-                Asset.coin == sol_mint.encode()  # You may need to adjust storage
-            )
+            select(Asset).where(Asset.wallet == wallet_pk, Asset.coin == sol_mint.encode())
         ).scalar_one_or_none()
 
         if sol_asset:
             if sol_asset.audited_amount_sum_lamports != sol_balance:
                 sol_asset.audited_amount_sum_lamports = sol_balance
                 sol_asset.audited_time_unix_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-                updated += 1
-                logging.info(f"[SYNC] Updated SOL balance for wallet {wallet_pk}")
-            else:
-                unchanged += 1
         else:
-            # Create new Asset for SOL
             new_asset = Asset(
                 wallet=wallet_pk,
                 coin=sol_mint.encode(),
@@ -1221,62 +1208,155 @@ def sync_wallet_balances(
                 isNative=True,
             )
             session.add(new_asset)
-            created += 1
-            logging.info(f"[SYNC] Created SOL asset for wallet {wallet_pk}")
-
-        # 2. Get all SPL token accounts
-        token_accounts = client.get_token_accounts_by_owner(
-            owner,
-            opts={"program_id": Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")}
-        ).value
-
-        for account in token_accounts:
-            mint = str(account.account.data.parsed["info"]["mint"])
-            amount = int(account.account.data.parsed["info"]["tokenAmount"]["amount"])
-
-            asset = session.execute(
-                select(Asset).where(
-                    Asset.wallet == wallet_pk,
-                    Asset.coin == mint.encode()
-                )
-            ).scalar_one_or_none()
-
-            if asset:
-                if asset.audited_amount_sum_lamports != amount:
-                    asset.audited_amount_sum_lamports = amount
-                    asset.audited_time_unix_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-                    updated += 1
-                    logging.info(f"[SYNC] Updated token {mint} for wallet {wallet_pk}")
-                else:
-                    unchanged += 1
-            else:
-                new_asset = Asset(
-                    wallet=wallet_pk,
-                    coin=mint.encode(),
-                    audited_amount_sum_lamports=amount,
-                    audited_time_unix_ms=int(datetime.now(timezone.utc).timestamp() * 1000),
-                    isNative=False,
-                )
-                session.add(new_asset)
-                created += 1
-                logging.info(f"[SYNC] Created new asset for token {mint} (wallet {wallet_pk})")
 
         session.commit()
-
-        summary = {
-            "created_assets": created,
-            "updated_assets": updated,
-            "unchanged_assets": unchanged,
-            "total_assets": created + updated + unchanged,
-        }
-
-        logging.info(f"[SYNC] Wallet {wallet_pk} sync complete: {summary}")
-        return Ok(summary)
+        logging.info(f"[SYNC] SOL balance synced for wallet {wallet_pk}")
+        return Ok({"status": "success", "sol_balance": sol_balance})
 
     except Exception as e:
         session.rollback()
         logging.error(f"[SYNC] Failed to sync wallet {wallet_pk}: {str(e)}")
         return Err(str(e))
+
+# def sync_wallet_balances(
+#     session: Session,
+#     wallet_pk: int,
+#     rpc_url: str = None,
+#     wallet_public_key: str = None,
+# ) -> Result[dict]:
+#     """
+#     Syncs on-chain balances (SOL + SPL tokens) into the Asset table.
+#     Auto-creates missing Token records to avoid foreign key violations.
+#     """
+#     if rpc_url is None:
+#         helius_key = os.getenv("HELIUS_API_KEY")
+#         rpc_url = f"https://mainnet.helius-rpc.com/?api-key={helius_key}"
+#
+#     if wallet_public_key is None:
+#         wallet = session.execute(select(Wallet).where(Wallet.id == wallet_pk)).scalar_one_or_none()
+#         if not wallet:
+#             return Err("Wallet not found")
+#         wallet_public_key = wallet.publicKey
+#
+#     client = Client(rpc_url)
+#     owner = Pubkey.from_string(wallet_public_key)
+#
+#     created = 0
+#     updated = 0
+#     unchanged = 0
+#
+#     try:
+#         # === 1. Sync SOL Balance ===
+#         sol_balance = client.get_balance(owner).value
+#         sol_mint = "So11111111111111111111111111111111111111112"
+#
+#         sol_asset = session.execute(
+#             select(Asset).where(Asset.wallet == wallet_pk, Asset.coin == sol_mint.encode())
+#         ).scalar_one_or_none()
+#
+#         if sol_asset:
+#             if sol_asset.audited_amount_sum_lamports != sol_balance:
+#                 sol_asset.audited_amount_sum_lamports = sol_balance
+#                 sol_asset.audited_time_unix_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+#                 updated += 1
+#         else:
+#             new_asset = Asset(
+#                 wallet=wallet_pk,
+#                 coin=sol_mint.encode(),
+#                 audited_amount_sum_lamports=sol_balance,
+#                 audited_time_unix_ms=int(datetime.now(timezone.utc).timestamp() * 1000),
+#                 isNative=True,
+#             )
+#             session.add(new_asset)
+#             created += 1
+#
+#         # === 2. Sync SPL Tokens ===
+#         try:
+#             resp = client.get_token_accounts_by_owner(
+#                 owner,
+#                 opts={
+#                     "program_id": Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
+#                     "encoding": "jsonParsed"
+#                 }
+#             )
+#             token_accounts = resp.value
+#         except Exception as e:
+#             logging.warning(f"[SYNC] Could not fetch token accounts: {str(e)}")
+#             token_accounts = []
+#
+#         for acc in token_accounts:
+#             try:
+#                 # Extract mint and amount safely
+#                 data = acc.account.data
+#                 if isinstance(data, dict) and "parsed" in data:
+#                     info = data["parsed"]["info"]
+#                 elif hasattr(data, "parsed"):
+#                     info = data.parsed["info"]
+#                 else:
+#                     continue
+#
+#                 mint = info["mint"]
+#                 amount = int(info["tokenAmount"]["amount"])
+#
+#                 # Check if Token exists, if not create a minimal one
+#                 token_exists = session.execute(
+#                     select(Token).where(Token.id == mint.encode())
+#                 ).scalar_one_or_none()
+#
+#                 if not token_exists:
+#                     # Create minimal Token record
+#                     new_token = Token(
+#                         id=mint.encode(),
+#                         name="Unknown",
+#                         tickerSymbol="UNK",
+#                         contractAddress=mint.encode(),
+#                         priceServer="jupiter",
+#                         exchangeSever="jupiter",
+#                         decimals=9,           # default, can be improved later
+#                         price_tracking=False,
+#                     )
+#                     session.add(new_token)
+#                     session.flush()  # get ID if needed
+#
+#                 # Now create or update Asset
+#                 asset = session.execute(
+#                     select(Asset).where(Asset.wallet == wallet_pk, Asset.coin == mint.encode())
+#                 ).scalar_one_or_none()
+#
+#                 if asset:
+#                     if asset.audited_amount_sum_lamports != amount:
+#                         asset.audited_amount_sum_lamports = amount
+#                         asset.audited_time_unix_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+#                         updated += 1
+#                 else:
+#                     new_asset = Asset(
+#                         wallet=wallet_pk,
+#                         coin=mint.encode(),
+#                         audited_amount_sum_lamports=amount,
+#                         audited_time_unix_ms=int(datetime.now(timezone.utc).timestamp() * 1000),
+#                         isNative=False,
+#                     )
+#                     session.add(new_asset)
+#                     created += 1
+#
+#             except Exception as e:
+#                 logging.warning(f"[SYNC] Error processing token account: {str(e)}")
+#                 continue
+#
+#         session.commit()
+#
+#         summary = {
+#             "created_assets": created,
+#             "updated_assets": updated,
+#             "unchanged_assets": unchanged,
+#         }
+#         logging.info(f"[SYNC] Wallet {wallet_pk} sync complete: {summary}")
+#         return Ok(summary)
+#
+#     except Exception as e:
+#         session.rollback()
+#         logging.error(f"[SYNC] Failed to sync wallet {wallet_pk}: {str(e)}")
+#         return Err(str(e))
 
 
 def get_jupiter_quote(
