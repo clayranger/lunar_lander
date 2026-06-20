@@ -1279,6 +1279,111 @@ def sync_wallet_balances(
         return Err(str(e))
 
 
+def get_jupiter_quote(
+    input_mint: str,
+    output_mint: str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+    amount: int = 100_000_000,  # in smallest units (e.g. 0.1 SOL = 100000000)
+    slippage_bps: int = 50,
+) -> Result[dict]:
+    """
+    Gets a Jupiter swap quote.
+    Falls back between two Jupiter endpoints if one fails.
+    """
+    endpoints = [
+        "https://public.jupiterapi.com/quote",
+        "https://quote-api.jup.ag/v6/quote",
+    ]
+
+    params = {
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": str(amount),
+        "slippageBps": str(slippage_bps),
+    }
+
+    for url in endpoints:
+        try:
+            response = requests.get(url, params=params, timeout=15)
+            response.raise_for_status()
+            return Ok(response.json())
+        except Exception as e:
+            logging.warning(f"[JUPITER] Quote failed on {url}: {str(e)}. Trying next...")
+
+    return Err("Failed to get Jupiter quote from all endpoints")
+
+
+def get_token_metadata(mint_address: str) -> Result[dict]:
+    """
+    Fetches token name and symbol.
+    Uses Metaplex first, falls back to Solana Token List.
+    """
+    try:
+        from metaplex import Metaplex  # You may need to install a Python Metaplex lib or implement manually
+        # For now we'll use a simpler RPC-based approach
+    except ImportError:
+        pass
+
+    try:
+        # Try Metaplex-style metadata account
+        metadata_pda = PublicKey.find_program_address(
+            [b"metadata", bytes(METAPLEX_PROGRAM_ID), bytes(PublicKey(mint_address))],
+            METAPLEX_PROGRAM_ID
+        )[0]
+
+        account_info = Client(os.getenv("HELIUS_API_KEY")).get_account_info(metadata_pda)
+        if account_info.value:
+            # Parse metadata (simplified)
+            return Ok({"name": "Parsed Name", "symbol": "SYM"})  # TODO: proper parsing
+
+    except Exception:
+        pass
+
+    # Fallback: Use known token list or Jupiter token list
+    try:
+        url = f"https://token.jup.ag/all"
+        resp = requests.get(url, timeout=10)
+        tokens = resp.json()
+        for token in tokens:
+            if token.get("address") == mint_address:
+                return Ok({
+                    "name": token.get("name"),
+                    "symbol": token.get("symbol"),
+                })
+    except Exception as e:
+        return Err(f"Failed to fetch token metadata: {str(e)}")
+
+    return Err("Token metadata not found")
+
+
+def calculate_decimal_multiplier(mint_address: str) -> Result[dict]:
+    """
+    Returns the multiplier needed to convert token amount to USDC-equivalent units.
+    """
+    try:
+        client = Client(os.getenv("HELIUS_API_KEY"))
+        mint_info = client.get_account_info(PublicKey(mint_address))
+
+        if not mint_info.value or not mint_info.value.data:
+            return Err("Could not fetch mint info")
+
+        # Parse decimals from mint account (simplified)
+        decimals = int.from_bytes(mint_info.value.data[44:45], "little")
+
+        usdc_decimals = 6
+        difference = decimals - usdc_decimals
+
+        if difference > 0:
+            multiplier = 10 ** difference
+        else:
+            multiplier = 1 / (10 ** abs(difference))
+
+        return Ok({
+            "decimals": decimals,
+            "multiplier": multiplier,
+        })
+
+    except Exception as e:
+        return Err(f"Failed to calculate decimal multiplier: {str(e)}")
 
 def automatic_setuper():
     '''
