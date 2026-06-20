@@ -98,8 +98,10 @@ def setup_known_tokens() -> Result[dict]:
 
 def full_dev_setup(public_key: Optional[str] = None) -> Result[dict]:
     """
-    Runs a full development database setup.
-    If public_key is provided, it will be added as a test wallet.
+    Full development database setup.
+    If public_key is provided:
+        - Inserts it as a test wallet
+        - Syncs its on-chain balances into the Asset table
     """
     logging.info("[SETUP] Starting full development setup...")
 
@@ -114,11 +116,33 @@ def full_dev_setup(public_key: Optional[str] = None) -> Result[dict]:
     # 3. Setup known tokens
     results["setup_known_tokens"] = setup_known_tokens()
 
+    wallet_id = None
+
     # 4. Insert test wallet (if public key provided)
     if public_key:
-        results["insert_test_wallet"] = insert_test_wallet(public_key)
+        wallet_res = insert_test_wallet(public_key)
+        results["insert_test_wallet"] = wallet_res
+
+        if wallet_res.is_ok:
+            # Get the wallet ID so we can sync balances
+            Session = sessionmaker(bind=engine)
+            session = Session()
+            try:
+                wallet = session.query(Wallet).filter_by(publicKey=public_key).first()
+                if wallet:
+                    wallet_id = wallet.id
+            finally:
+                session.close()
     else:
         results["insert_test_wallet"] = "Skipped (no public_key provided)"
+
+    # 5. Sync wallet balances (if we have a wallet)
+    if wallet_id:
+        sync_res = sync_wallet_balances(wallet_pk=wallet_id)
+        results["sync_wallet_balances"] = sync_res.value if sync_res.is_ok else str(sync_res.error)
+        logging.info("[SETUP] Wallet balances synced")
+    else:
+        results["sync_wallet_balances"] = "Skipped (no wallet)"
 
     logging.info("[SETUP] Full development setup completed")
     return Ok(results)
