@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session, declarative_base, Mapped, mapped_column, rel
 from sqlalchemy import Integer, String, Boolean, BigInteger, LargeBinary, Float, ForeignKey, cast
 
 from pydantic import BaseModel, Field
-#from result import Result, Ok, Err
+from result import Result, Ok, Err
 
 import os
 from dotenv import load_dotenv
@@ -591,21 +591,7 @@ def get_open_tax_securities(session: Session, wallet_pk: int) -> Result[List[Sec
 
 # =============================================================================
 # 7. HIGH-LEVEL TRADE EXECUTION (Orchestrator)
-# =============================================================================
-
-import os
-import time
-import base64
-import json
-import logging
-from typing import Optional
-from result import Result, Ok, Err
-
-from solders.keypair import Keypair
-from solders.transaction import VersionedTransaction
-from solana.rpc.api import Client
-from solana.rpc.commitment import Commitment
-
+# ============================================================================
 
 def load_keypair_from_file(filepath: str) -> Keypair:
     with open(filepath, "r") as f:
