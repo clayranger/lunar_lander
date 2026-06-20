@@ -1278,3 +1278,168 @@ def sync_wallet_balances(
         logging.error(f"[SYNC] Failed to sync wallet {wallet_pk}: {str(e)}")
         return Err(str(e))
 
+
+
+def automatic_setuper():
+    '''
+    TODO
+    get this ready for ALPHA
+    '''
+    def create_database():
+        Base.metadata.create_all(engine)
+        print("created")
+        return
+
+    def delete_database():
+        Base.metadata.drop_all(engine)
+        return
+    def add_default_user():
+        '''
+        TODO
+        store salt in db
+        '''
+        given_password = b"m11ay321"
+        salt = bcrypt.gensalt()
+        hashed_password = bcrypt.hashpw(given_password, salt)
+        user = User(
+            username="adam",
+            password=hashed_password)
+        Session = sessionmaker(bind=engine)
+        session = Session()
+        try:
+            session.add(user)
+            session.commit()
+        except Exception as e:
+            print(f"error with database:  {e}")
+            session.rollback()
+        finally:
+            session.close()
+        return
+    def testing_insert_wallet_id():
+        '''version 0.1. This function is for testing purposes only
+        It inserts a given wallet string into the database for all users.'''
+        #for all users
+        #delete any wallets already owned
+        #insert the given wallet string
+        given_public_key = "FnEKih68qukzTfhJ8TLQHWGHvFv3vrRUsgfsPq6Fe19y"
+        Session = sessionmaker(bind=engine)
+        session = Session()
+        my_users = session.query(User).all()
+        wallets = session.query(Wallet).all()
+        for person in my_users:
+            user_id = person.id
+            print("a user has been located: " + str(user_id))
+            #for each token in selected token list
+            #   add to list of tokens
+            #   record lowest latency request
+            #token list is a list of the tokens and their lowest latencyies
+            for entry in wallets:
+                row_to_delete = session.query(Wallet).get(entry.id)
+                session.delete(row_to_delete)
+                session.commit()
+            #now lets insert the wallet into a new entry
+            #TODO correct for actual wallet data structure.
+            wallet = Wallet(
+                publicKey=given_public_key,
+                parent_id=person.id
+            )
+            session.add(wallet)
+            session.commit()
+            print("database has been modified")
+        session.close()
+        return
+    def testing_setupKnownTokens():
+            ######################################################################################################################
+            #!|!|!|!|!|!|!MAJOR BUG -> MUST take in decimals into token from metadata                                            #
+            ######################################################################################################################
+        print("hello. I am setupDatabases 0.1")
+        Session = sessionmaker(bind=engine)
+        session = Session()
+        for entry in solana_tokens:
+            error = None
+            newNumber = base58.b58decode(entry)
+            print("token id")
+            # < represents little endian
+            # i represent integer
+            # 4 represendts 4 byte array entries which I chose because 20/4 r=0
+            numberist = np.frombuffer(newNumber, dtype='<i4')
+            print("numberist")
+            print(numberist)
+            does_exist = session.query(session.query(Token).filter_by(id=cast(numberist, BYTEA)).exists()).scalar()
+            print("database query complete")
+            if does_exist:
+                print("does exist")
+                error= ('exsists')
+            else:
+                print("does not exist")
+                try:
+                    url_to_go = "http://" + BANK_MANAGER + "/api/get_meta/" + entry + "/"
+                    my_response = requests.get(url_to_go)
+                    resp_dict = my_response.json()
+                    #addition of decimal insertion as testing approaches
+                    second_url_to_go = "http://" + BANK_MANAGER + "/api/get_quote/" + entry + "/"
+                    my_second_response = requests.get(second_url_to_go)
+                    resp_second_dict = my_second_response.json()
+                except Exception as e:
+                    print("error getting url: " + e)
+                else:
+                    print("token name:" + resp_dict['name'])
+                    print("token symbol:" + resp_dict['symbol'])
+                    if error is None:
+                        print("token id")
+                        currentToken = Token(
+                            id=cast(numberist, BYTEA),
+                            name=resp_dict['name'],
+                            tickerSymbol=resp_dict['symbol'],
+                            priceServer='jupiter',
+                            exchangeSever='jupiter',
+                            decimals=resp_second_dict["decimals"]
+                        )
+                        text = resp_dict['name'] + " was added to the database."
+                        print("enter name as")
+                        print(resp_dict['name'])
+                        try:
+                            session.add(currentToken)
+                            session.commit()
+                        except Exception as e:
+                            print(f"db error: {e}")
+        session.close()
+        return
+    def testing_selectAllTokens():
+        Session = sessionmaker(bind=engine)
+        session = Session()
+        my_users = session.query(User).all()
+        tokens = session.query(Token).all()
+        for person in my_users:
+            user_id = person.id
+            for entry in tokens:
+                print(" token:" + entry.name)
+                print("selected current token")
+                print("token id")
+                # < represents little endian
+                # i represent integer
+                # 4 represendts 4 byte array entries which I chose because 20/4 r=0
+                numberist = np.frombuffer(entry.id, dtype='<i4')
+                does_exist = session.query(select(SelectedToken).filter(SelectedToken.parent_id==entry.id, SelectedToken.owner==user_id).exists()).scalar()
+                if does_exist:
+                    print(does_exist)
+                else:
+                    selectedToken = SelectedToken(
+                        owner = user_id,
+                        parent_id = entry.id#,
+                        #depricated
+                        #latency = 2
+                    )
+                    session.add(selectedToken)
+                    session.commit()
+        session.close()
+        print("select all tokens: action complete")
+        return
+    delete_database()
+    create_database()
+    add_default_user()
+    testing_insert_wallet_id()
+    testing_setupKnownTokens()
+    testing_selectAllTokens()
+    sync_wallet_balances(#...)
+    return
