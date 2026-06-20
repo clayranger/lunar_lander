@@ -1099,49 +1099,6 @@ def log_trade_result(
         logging.error(f"[TRADE] {log_entry}")
 
 
-def confirm_transaction(
-    tx_signature: str,
-    rpc_url: str = "https://api.devnet.solana.com",
-    max_retries: int = 30,
-    sleep_seconds: float = 2.0
-) -> Result[dict]:
-    """
-    Waits for a transaction to be confirmed on-chain.
-    Returns transaction status once confirmed or fails after max retries.
-    """
-    client = Client(rpc_url)
-
-    for attempt in range(max_retries):
-        try:
-            response = client.get_transaction(
-                tx_signature,
-                commitment=Commitment("confirmed"),
-                max_supported_transaction_version=0
-            )
-
-            if response.value:
-                meta = response.value.transaction.meta
-                if meta and meta.err is None:
-                    logging.info(f"[CONFIRM] Transaction confirmed: {tx_signature}")
-                    return Ok({
-                        "signature": tx_signature,
-                        "status": "confirmed",
-                        "slot": response.value.slot,
-                    })
-                else:
-                    return Err(f"Transaction failed on-chain: {meta.err if meta else 'Unknown error'}")
-
-            logging.info(f"[CONFIRM] Attempt {attempt + 1}/{max_retries} - not confirmed yet...")
-            time.sleep(sleep_seconds)
-
-        except Exception as e:
-            logging.warning(f"[CONFIRM] Error checking transaction: {str(e)}")
-            time.sleep(sleep_seconds)
-
-    return Err(f"Transaction not confirmed after {max_retries} attempts")
-
-
-
 
 
 
