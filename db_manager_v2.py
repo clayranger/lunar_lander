@@ -16,7 +16,7 @@ import base64
 import logging
 import time
 from datetime import datetime
-from global_values import WORLD_STABLE_COIN
+from global_values import WORLD_STABLE_COIN, solana_tokens, WORLD_PLATFORM_COIN
 from contextlib import contextmanager
 
 from sqlalchemy import create_engine, select, func
