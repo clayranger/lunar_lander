@@ -15,7 +15,7 @@ import base58
 import base64
 import logging
 import time
-import binascii
+#import binascii
 
 from datetime import datetime
 from global_values import WORLD_STABLE_COIN, solana_tokens, WORLD_PLATFORM_COIN
