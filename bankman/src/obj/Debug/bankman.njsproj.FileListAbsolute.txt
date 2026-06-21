@@ -1,2 +1,0 @@
-\\wsl.localhost\Debian\home\adam\bankman\src\obj\Debug\bankman.njsproj.AssemblyReference.cache
-\\wsl.localhost\Debian\home\adam\bankman\src\obj\Debug\bankman.njsproj.CoreCompileInputs.cache
