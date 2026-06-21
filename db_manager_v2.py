@@ -602,38 +602,32 @@ def load_keypair_from_file(filepath: str) -> Keypair:
     return Keypair.from_bytes(bytes(secret))
 
 
-def get_current_priority_fee(client: Client, min_fee: int = 100_000) -> int:
-    """Get a reasonable priority fee based on recent network conditions."""
+def get_current_priority_fee(min_fee: int = 100_000) -> int:
+    client = get_solana_client()
     try:
-        # Get recent prioritization fees
         fees = client.get_recent_prioritization_fees()
         if fees.value:
-            # Take a high percentile to be competitive
             recent_fees = [f.prioritization_fee for f in fees.value if f.prioritization_fee > 0]
             if recent_fees:
-                suggested = int(np.percentile(recent_fees, 75))  # 75th percentile
-                return max(min_fee, suggested * 2)  # Add safety margin
+                suggested = int(np.percentile(recent_fees, 75))
+                return max(min_fee, suggested * 2)
     except Exception as e:
-        logging.warning(f"Could not fetch dynamic priority fee: {str(e)}")
-
-    return min_fee * 5  # fallback
+        logging.warning(f"Priority fee fetch failed: {str(e)}")
+    return min_fee * 5
 
 
 def get_jupiter_swap_transaction_from_helius(
-    helius_api_key: str,
     wallet_public_key: str,
     input_mint: str,
     output_mint: str,
     amount: int,
     slippage_bps: int = 50,
-    client: Client = None,
 ) -> Result[str]:
-    """Get swap transaction from Helius with dynamic priority fee."""
-    if client is None:
-        client = Client(f"https://mainnet.helius-rpc.com/?api-key={helius_api_key}")
+    client = get_solana_client()
+    priority_fee = get_current_priority_fee()
 
-    priority_fee = get_current_priority_fee(client)
-
+    # You can keep using Helius API for Jupiter swaps even if using Alchemy for RPC
+    helius_api_key = os.getenv("HELIUS_API_KEY")
     url = f"https://api.helius.xyz/v0/transactions/swap?api-key={helius_api_key}"
 
     payload = {
@@ -652,17 +646,13 @@ def get_jupiter_swap_transaction_from_helius(
         response = requests.post(url, json=payload, timeout=30)
         response.raise_for_status()
         data = response.json()
-
         tx_base64 = data.get("swapTransaction")
         if not tx_base64:
-            return Err("No swapTransaction returned from Helius")
-
+            return Err("No swapTransaction returned")
         logging.info(f"[SWAP] Using priority fee: {priority_fee} lamports")
         return Ok(tx_base64)
-
     except Exception as e:
-        return Err(f"Helius swap request failed: {str(e)}")
-
+        return Err(f"Swap request failed: {str(e)}")
 
 def sign_and_send_transaction(
     tx_base64: str,
