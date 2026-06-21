@@ -15,8 +15,7 @@ import base58
 import base64
 import logging
 import time
-#import binascii
-
+from rpc_client import get_solana_client
 from datetime import datetime
 from global_values import WORLD_STABLE_COIN, solana_tokens, WORLD_PLATFORM_COIN
 from contextlib import contextmanager
@@ -616,7 +615,7 @@ def get_current_priority_fee(min_fee: int = 100_000) -> int:
     return min_fee * 5
 
 
-def get_jupiter_swap_transaction_from_helius(
+def get_jupiter_swap_transaction(
     wallet_public_key: str,
     input_mint: str,
     output_mint: str,
@@ -792,7 +791,7 @@ def execute_trade_with_gas(
             # === Get swap tx with dynamic priority fee ===
             logging.info(f"[SWAP] Attempt {attempt}/{max_retries} | Priority fee: {priority_fee} lamports")
 
-            swap_tx_res = get_jupiter_swap_transaction_from_helius(
+            swap_tx_res = get_jupiter_swap_transaction(
                 helius_api_key=helius_api_key,
                 wallet_public_key=wallet_public_key,
                 input_mint=WORLD_STABLE_COIN,
@@ -1400,7 +1399,7 @@ def calculate_decimal_multiplier(mint_address: str) -> Result[dict]:
     Returns the multiplier needed to convert token amount to USDC-equivalent units.
     """
     try:
-        client = Client(os.getenv("HELIUS_API_KEY"))
+        client = get_solana_client()
         mint_info = client.get_account_info(PublicKey(mint_address))
 
         if not mint_info.value or not mint_info.value.data:
