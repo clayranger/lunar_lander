@@ -7,7 +7,7 @@ Do NOT import this in production.
 import logging
 from typing import Optional
 from result import Result, Ok, Err
-
+from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 from db_manager_v2 import (
     engine,
@@ -24,6 +24,8 @@ from global_values import solana_tokens
 import bcrypt
 from solders.pubkey import Pubkey
 from solana.rpc.api import Client
+import os
+import time
 
 
 def create_tables() -> Result:
@@ -94,12 +96,13 @@ def insert_test_wallet(public_key: str) -> Result:
     finally:
         session.close()
 
-
 def setup_known_tokens() -> Result:
     """
-    Robust version that creates Token records even if metadata is incomplete.
-    Prioritizes getting correct decimals.
+    Creates Token records.
+    Ensures WORLD_PLATFORM_COIN and WORLD_STABLE_COIN exist.
     """
+    from global_values import WORLD_PLATFORM_COIN, WORLD_STABLE_COIN
+
     Session = sessionmaker(bind=engine)
     session = Session()
 
@@ -110,28 +113,36 @@ def setup_known_tokens() -> Result:
     try:
         client = Client(os.getenv("HELIUS_API_KEY"))
 
-        for mint_address in solana_tokens:
+        # === Ensure WORLD_PLATFORM_COIN (native coin) ===
+        created += _ensure_token_exists(session, WORLD_PLATFORM_COIN, "Platform Coin", "PLATFORM", 9)
+        skipped += 1 if created == 0 else 0   # simplistic count, can be improved
+
+        # === Ensure WORLD_STABLE_COIN (e.g. USDC) ===
+        created += _ensure_token_exists(session, WORLD_STABLE_COIN, "Stable Coin", "STABLE", 6)
+
+        # === Process the rest of solana_tokens ===
+        for i, mint_address in enumerate(solana_tokens):
             try:
-                token_key = get_token_key(mint_address)
-                if token_key.is_err:
+                token_key_result = get_token_key(mint_address)
+                if token_key_result.is_err():
                     failed += 1
                     continue
 
-                token_id = token_key.value.tobytes()
+                token_id = token_key_result.unwrap().tobytes()
 
-                # Skip if already exists
                 if session.execute(select(Token).where(Token.id == token_id)).scalar_one_or_none():
                     skipped += 1
                     continue
 
-                # Get decimals (most important)
                 decimals = 9
                 try:
-                    mint_info = client.get_account_info(Pubkey.from_string(mint_address))
-                    if mint_info.value and mint_info.value.data:
-                        decimals = mint_info.value.data[44]
+                    time.sleep(0.1)
+                    supply_resp = client.get_token_supply(Pubkey.from_string(mint_address))
+                    if supply_resp.value and supply_resp.value.decimals is not None:
+                        decimals = supply_resp.value.decimals
                 except Exception as e:
-                    logging.warning(f"[SETUP] Could not get decimals for {mint_address[:8]}: {str(e)}")
+                    if "UnsupportedProtocol" not in str(e):
+                        logging.warning(f"[{i}] Could not fetch decimals for {mint_address[:8]}: {str(e)}")
 
                 new_token = Token(
                     id=token_id,
@@ -147,15 +158,20 @@ def setup_known_tokens() -> Result:
                 session.add(new_token)
                 session.commit()
                 created += 1
-                logging.info(f"[SETUP] Added token {mint_address[:8]}... (decimals={decimals})")
+                logging.info(f"[{i}] Added token {mint_address[:8]} (decimals={decimals})")
 
             except Exception as e:
-                logging.error(f"[SETUP] Error with {mint_address[:8]}: {str(e)}")
+                logging.error(f"[{i}] Error with {mint_address[:8]}: {str(e)}")
                 session.rollback()
                 failed += 1
 
-        summary = {"created": created, "skipped": skipped, "failed": failed}
-        logging.info(f"[SETUP] Token setup complete: {summary}")
+        summary = {
+            "created": created,
+            "skipped": skipped,
+            "failed": failed,
+            "total": len(solana_tokens) + 2,
+        }
+        logging.info(f"[SETUP] Token setup finished: {summary}")
         return Ok(summary)
 
     except Exception as e:
@@ -164,10 +180,47 @@ def setup_known_tokens() -> Result:
     finally:
         session.close()
 
+
+def _ensure_token_exists(session, mint_address: str, name: str, symbol: str, decimals: int) -> int:
+    """Helper to ensure a specific token exists. Returns 1 if created, 0 otherwise."""
+    try:
+        token_key = get_token_key(mint_address)
+        if token_key.is_err():
+            logging.warning(f"[SETUP] Could not process {mint_address[:8]}: {token_key.err_value}")
+            return 0
+
+        token_id = token_key.unwrap().tobytes()
+
+        if session.execute(select(Token).where(Token.id == token_id)).scalar_one_or_none():
+            return 0  # already exists
+
+        new_token = Token(
+            id=token_id,
+            name=name,
+            tickerSymbol=symbol,
+            contractAddress=token_id,
+            priceServer="jupiter",
+            exchangeSever="jupiter",
+            decimals=decimals,
+            price_tracking=True,
+        )
+        session.add(new_token)
+        session.commit()
+        logging.info(f"[SETUP] Added {name} ({mint_address[:8]}...)")
+        return 1
+    except Exception as e:
+        logging.warning(f"[SETUP] Error ensuring {mint_address[:8]}: {str(e)}")
+        return 0
+
+
+
+        
+
 def full_dev_setup(public_key: Optional[str] = None) -> Result:
     """
     Full development database setup.
-    If public_key is provided, it will be inserted as a test wallet.
+    If public_key is provided, it will be inserted as a test wallet
+    and balances will be synced (creating Assets where needed).
     """
     logging.info("[SETUP] Starting full development setup...")
 
@@ -183,7 +236,7 @@ def full_dev_setup(public_key: Optional[str] = None) -> Result:
         wallet_res = insert_test_wallet(public_key)
         results["insert_test_wallet"] = wallet_res
 
-        if wallet_res.is_ok:
+        if wallet_res.is_ok():
             Session = sessionmaker(bind=engine)
             session = Session()
             try:
@@ -195,11 +248,11 @@ def full_dev_setup(public_key: Optional[str] = None) -> Result:
     else:
         results["insert_test_wallet"] = "Skipped (no public_key provided)"
 
-    # Sync balances (currently read-only to avoid FK issues)
+    # Sync wallet balances (now creates/updates Assets properly)
     if wallet_id:
         with get_session(engine) as session:
             sync_res = sync_wallet_balances(session=session, wallet_pk=wallet_id)
-        results["sync_wallet_balances"] = sync_res.value if sync_res.is_ok else str(sync_res.error)
+        results["sync_wallet_balances"] = sync_res.value if sync_res.is_ok() else str(sync_res.err_value)
     else:
         results["sync_wallet_balances"] = "Skipped"
 
