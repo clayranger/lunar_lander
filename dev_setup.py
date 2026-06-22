@@ -97,30 +97,23 @@ def insert_test_wallet(public_key: str) -> Result:
         session.close()
 
 def setup_known_tokens() -> Result:
-    """
-    Creates Token records.
-    Ensures WORLD_PLATFORM_COIN and WORLD_STABLE_COIN exist.
-    """
+    from rpc_client import get_solana_client
     from global_values import WORLD_PLATFORM_COIN, WORLD_STABLE_COIN
 
     Session = sessionmaker(bind=engine)
     session = Session()
+    client = get_solana_client()
 
     created = 0
     skipped = 0
     failed = 0
 
     try:
-        client = Client(os.getenv("HELIUS_API_KEY"))
-
-        # === Ensure WORLD_PLATFORM_COIN (native coin) ===
+        # Ensure WORLD_PLATFORM_COIN and WORLD_STABLE_COIN
         created += _ensure_token_exists(session, WORLD_PLATFORM_COIN, "Platform Coin", "PLATFORM", 9)
-        skipped += 1 if created == 0 else 0   # simplistic count, can be improved
-
-        # === Ensure WORLD_STABLE_COIN (e.g. USDC) ===
         created += _ensure_token_exists(session, WORLD_STABLE_COIN, "Stable Coin", "STABLE", 6)
 
-        # === Process the rest of solana_tokens ===
+        # Process rest of solana_tokens
         for i, mint_address in enumerate(solana_tokens):
             try:
                 token_key_result = get_token_key(mint_address)
@@ -142,7 +135,7 @@ def setup_known_tokens() -> Result:
                         decimals = supply_resp.value.decimals
                 except Exception as e:
                     if "UnsupportedProtocol" not in str(e):
-                        logging.warning(f"[{i}] Could not fetch decimals for {mint_address[:8]}: {str(e)}")
+                        logging.warning(f"[{i}] Could not fetch decimals: {str(e)}")
 
                 new_token = Token(
                     id=token_id,
@@ -154,7 +147,6 @@ def setup_known_tokens() -> Result:
                     decimals=decimals,
                     price_tracking=True,
                 )
-
                 session.add(new_token)
                 session.commit()
                 created += 1
@@ -165,12 +157,7 @@ def setup_known_tokens() -> Result:
                 session.rollback()
                 failed += 1
 
-        summary = {
-            "created": created,
-            "skipped": skipped,
-            "failed": failed,
-            "total": len(solana_tokens) + 2,
-        }
+        summary = {"created": created, "skipped": skipped, "failed": failed}
         logging.info(f"[SETUP] Token setup finished: {summary}")
         return Ok(summary)
 

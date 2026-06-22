@@ -9,6 +9,8 @@ Design goals:
 """
 
 from __future__ import annotations
+from dotenv import load_dotenv
+
 from typing import List, Optional, Dict, Any
 import numpy as np
 import base58
@@ -29,7 +31,7 @@ from pydantic import BaseModel, Field
 from result import Result, Ok, Err
 
 import os
-from dotenv import load_dotenv
+
 import requests
 
 from solana.rpc.api import Client
@@ -600,9 +602,11 @@ def load_keypair_from_file(filepath: str) -> Keypair:
         secret = json.load(f)
     return Keypair.from_bytes(bytes(secret))
 
-
 def get_current_priority_fee(min_fee: int = 100_000) -> int:
+    """Get dynamic priority fee using the primary/backup RPC client."""
+    from rpc_client import get_solana_client
     client = get_solana_client()
+
     try:
         fees = client.get_recent_prioritization_fees()
         if fees.value:
@@ -611,7 +615,8 @@ def get_current_priority_fee(min_fee: int = 100_000) -> int:
                 suggested = int(np.percentile(recent_fees, 75))
                 return max(min_fee, suggested * 2)
     except Exception as e:
-        logging.warning(f"Priority fee fetch failed: {str(e)}")
+        logging.warning(f"[RPC] Priority fee fetch failed: {str(e)}")
+
     return min_fee * 5
 
 
@@ -730,13 +735,13 @@ def execute_trade_with_gas(
     slippage_bps: int = 50,
 ) -> Result[dict]:
     """
-    Full trade orchestrator with dynamic priority fees + automatic logging.
+    Full trade orchestrator with dynamic priority fees and automatic RPC fallback.
     """
-    logging.info(f"[TRADE] Starting trade | investment_id={investment_id} | wallet={wallet_pk}")
+    logging.info(f"[TRADE] Starting trade | investment_id={investment_id}")
 
     helius_api_key = os.getenv("HELIUS_API_KEY")
     if not helius_api_key:
-        return Err("HELIUS_API_KEY not found")
+        return Err("HELIUS_API_KEY not found in environment variables")
 
     # Load keypair
     try:
@@ -745,13 +750,12 @@ def execute_trade_with_gas(
     except Exception as e:
         return Err(f"Failed to load keypair: {str(e)}")
 
-    # Calculate priority fee once per trade attempt cycle
-    client = Client(f"https://mainnet.helius-rpc.com/?api-key={helius_api_key}")
-    priority_fee = get_current_priority_fee(client)
+    # Calculate priority fee once
+    priority_fee = get_current_priority_fee()
 
     for attempt in range(1, max_retries + 1):
         try:
-            # === Load Investment + Safety + Gas checks (unchanged) ===
+            # === Load Investment ===
             inv = session.execute(
                 select(Investment).where(Investment.id == investment_id)
             ).scalar_one_or_none()
@@ -772,7 +776,14 @@ def execute_trade_with_gas(
             if sell_lamports <= 0 or sell_lamports > inv.amount:
                 return Err("Invalid sell amount")
 
-            safety = pre_trade_safety_check(...)
+            # === Safety + Gas checks ===
+            safety = pre_trade_safety_check(
+                session=session,
+                investment_id=investment_id,
+                sell_lamports=sell_lamports,
+                estimated_gas_lamports=estimated_gas_lamports,
+                wallet_pk=wallet_pk,
+            )
             if safety.is_err():
                 log_trade_result(
                     investment_id=investment_id,
@@ -783,16 +794,14 @@ def execute_trade_with_gas(
                 )
                 return Err(f"Safety check failed: {safety.err_value}")
 
-            # Gas check...
             gas_check = ensure_sufficient_gas(session, estimated_gas_lamports, wallet_pk)
             if gas_check.is_err():
                 return gas_check
 
-            # === Get swap tx with dynamic priority fee ===
+            # === Get swap transaction (now uses dynamic priority fee + RPC fallback) ===
             logging.info(f"[SWAP] Attempt {attempt}/{max_retries} | Priority fee: {priority_fee} lamports")
 
-            swap_tx_res = get_jupiter_swap_transaction(
-                helius_api_key=helius_api_key,
+            swap_tx_res = get_jupiter_swap_transaction(   # ← renamed function
                 wallet_public_key=wallet_public_key,
                 input_mint=WORLD_STABLE_COIN,
                 output_mint=target_mint,
@@ -810,21 +819,32 @@ def execute_trade_with_gas(
                     priority_fee_lamports=priority_fee,
                 )
                 if attempt == max_retries:
-                    return Err(f"Helius swap failed after {max_retries} attempts: {error_msg}")
+                    return Err(f"Swap failed after {max_retries} attempts: {error_msg}")
                 time.sleep(2)
                 continue
 
             tx_base64 = swap_tx_res.ok_value
 
-            # Sign & send
+            # === Sign and send ===
             send_res = sign_and_send_transaction(tx_base64, keypair)
             if send_res.is_err():
-                # ... logging + retry logic
+                error_msg = send_res.err_value
+                log_trade_result(
+                    investment_id=investment_id,
+                    wallet_pk=wallet_pk,
+                    status="failed",
+                    error_message=error_msg,
+                    priority_fee_lamports=priority_fee,
+                )
+                if attempt == max_retries:
+                    return Err(f"Sign/Send failed after {max_retries} attempts: {error_msg}")
+                time.sleep(2)
                 continue
 
             tx_sig = send_res.ok_value
+            logging.info(f"[SWAP] Transaction sent: {tx_sig}")
 
-            # Confirm
+            # === Confirm ===
             confirm_res = confirm_transaction(tx_sig)
             if confirm_res.is_err():
                 log_trade_result(
@@ -836,14 +856,31 @@ def execute_trade_with_gas(
                 )
                 return Err(f"Transaction confirmation failed: {confirm_res.err_value}")
 
-            # === Record everything ===
-            record_res = record_partial_sell(...)
+            logging.info(f"[CONFIRM] Transaction confirmed: {tx_sig}")
+
+            # === Record trade ===
+            record_res = record_partial_sell(
+                session=session,
+                investment_id=investment_id,
+                sold_lamports=sell_lamports,
+                sell_tx_id=tx_sig,
+                sell_price_usdc=0.0,
+            )
             if record_res.is_err():
                 return record_res
 
-            # Gas + Tax logic...
+            # Spend gas + withhold tax
+            if gas_security_id:
+                spend_gas_security(session, gas_security_id, estimated_gas_lamports, tx_sig)
 
-            # === Final Success Log ===
+            withhold_tax_on_profitable_sale(
+                session=session,
+                investment_id=investment_id,
+                sell_proceeds_usdc=0.0,
+                wallet_pk=wallet_pk,
+            )
+
+            # === Final success log ===
             log_trade_result(
                 investment_id=investment_id,
                 wallet_pk=wallet_pk,
@@ -875,6 +912,137 @@ def execute_trade_with_gas(
             time.sleep(2)
 
     return Err(f"Trade failed after {max_retries} attempts")
+
+
+def sync_wallet_balances(
+    session: Session,
+    wallet_pk: int,
+    wallet_public_key: str = None,
+) -> Result:
+    """
+    Syncs on-chain balances into the Asset table.
+    Uses dynamic RPC client (with automatic fallback).
+    """
+    from rpc_client import get_solana_client
+    from global_values import WORLD_PLATFORM_COIN
+
+    if wallet_public_key is None:
+        wallet = session.execute(select(Wallet).where(Wallet.id == wallet_pk)).scalar_one_or_none()
+        if not wallet:
+            return Err("Wallet not found")
+        wallet_public_key = wallet.publicKey
+
+    client = get_solana_client()
+    owner = Pubkey.from_string(wallet_public_key)
+
+    created = 0
+    updated = 0
+
+    try:
+        # === 1. Sync Native Platform Coin (SOL or future native coin) ===
+        platform_key = get_token_key(WORLD_PLATFORM_COIN)
+        if platform_key.is_err():
+            return Err(platform_key.err_value)
+
+        platform_mint = platform_key.unwrap().tobytes()
+        native_balance = client.get_balance(owner).value
+
+        native_asset = session.execute(
+            select(Asset).where(Asset.wallet == wallet_pk, Asset.coin == platform_mint)
+        ).scalar_one_or_none()
+
+        if native_asset:
+            if native_asset.audited_amount_sum_lamports != native_balance:
+                native_asset.audited_amount_sum_lamports = native_balance
+                native_asset.audited_time_unix_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                updated += 1
+        else:
+            new_asset = Asset(
+                wallet=wallet_pk,
+                coin=platform_mint,
+                audited_amount_sum_lamports=native_balance,
+                audited_time_unix_ms=int(datetime.now(timezone.utc).timestamp() * 1000),
+                isNative=True,
+            )
+            session.add(new_asset)
+            created += 1
+
+        # === 2. Sync SPL Tokens (robust parsing) ===
+        try:
+            resp = client.get_token_accounts_by_owner(
+                owner,
+                opts={
+                    "program_id": Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
+                    "encoding": "jsonParsed"
+                }
+            )
+            token_accounts = resp.value or []
+        except Exception as e:
+            logging.warning(f"[SYNC] Could not fetch token accounts: {str(e)}")
+            token_accounts = []
+
+        for acc in token_accounts:
+            try:
+                data = acc.account.data
+
+                # Handle both dict and object response styles safely
+                if isinstance(data, dict):
+                    parsed = data.get("parsed")
+                    if not parsed:
+                        continue
+                    info = parsed.get("info", {})
+                elif hasattr(data, "parsed"):
+                    info = getattr(data.parsed, "info", {}) or {}
+                else:
+                    continue
+
+                mint = info.get("mint")
+                token_amount = info.get("tokenAmount", {})
+                if not mint or not token_amount:
+                    continue
+
+                amount = int(token_amount.get("amount", 0))
+
+                # Only process tokens that exist in our token_table
+                token_exists = session.execute(
+                    select(Token).where(Token.id == mint.encode())
+                ).scalar_one_or_none()
+                if not token_exists:
+                    continue
+
+                asset = session.execute(
+                    select(Asset).where(Asset.wallet == wallet_pk, Asset.coin == mint.encode())
+                ).scalar_one_or_none()
+
+                if asset:
+                    if asset.audited_amount_sum_lamports != amount:
+                        asset.audited_amount_sum_lamports = amount
+                        asset.audited_time_unix_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                        updated += 1
+                else:
+                    new_asset = Asset(
+                        wallet=wallet_pk,
+                        coin=mint.encode(),
+                        audited_amount_sum_lamports=amount,
+                        audited_time_unix_ms=int(datetime.now(timezone.utc).timestamp() * 1000),
+                        isNative=False,
+                    )
+                    session.add(new_asset)
+                    created += 1
+
+            except Exception as e:
+                logging.debug(f"[SYNC] Skipped token account: {str(e)}")
+                continue
+
+        session.commit()
+        summary = {"created_assets": created, "updated_assets": updated}
+        logging.info(f"[SYNC] Wallet {wallet_pk} sync complete: {summary}")
+        return Ok(summary)
+
+    except Exception as e:
+        session.rollback()
+        logging.error(f"[SYNC] Failed to sync wallet {wallet_pk}: {str(e)}")
+        return Err(str(e))
 
 
 
@@ -1134,8 +1302,8 @@ def execute_sell_percentage_investment(
     slippage_bps: int = 50,
 ) -> Result[dict]:
     """
-    Sells a specific percentage of an investment on mainnet.
-    Now cleanly exposes slippage_bps.
+    Sells a percentage of an investment.
+    Cleanly exposes slippage_bps and uses the latest trade engine.
     """
     if wallet_pk is None:
         single = get_single_wallet_pk(session)
@@ -1163,6 +1331,7 @@ def execute_sell_percentage_investment(
     if sell_lamports <= 0:
         return Err("Calculated sell amount is zero or negative")
 
+    # Call the main trade engine
     return execute_trade_with_gas(
         session=session,
         investment_id=investment_id,
@@ -1177,144 +1346,6 @@ def execute_sell_percentage_investment(
 
 
 
-def sync_wallet_balances(
-    session: Session,
-    wallet_pk: int,
-    rpc_url: str = None,
-    wallet_public_key: str = None,
-) -> Result:
-    """
-    Syncs on-chain balances into the Asset table.
-    Uses WORLD_PLATFORM_COIN for the native asset (easy to switch chains).
-    Returns-style error handling.
-    """
-    from global_values import WORLD_PLATFORM_COIN
-
-    if rpc_url is None:
-        helius_key = os.getenv("HELIUS_API_KEY")
-        rpc_url = f"https://mainnet.helius-rpc.com/?api-key={helius_key}"
-
-    if wallet_public_key is None:
-        wallet = session.execute(select(Wallet).where(Wallet.id == wallet_pk)).scalar_one_or_none()
-        if not wallet:
-            return Err("Wallet not found")
-        wallet_public_key = wallet.publicKey
-
-    client = Client(rpc_url)
-    owner = Pubkey.from_string(wallet_public_key)
-
-    created = 0
-    updated = 0
-    unchanged = 0
-
-    try:
-        # === Get platform coin mint from WORLD_PLATFORM_COIN ===
-        platform_key_result = get_token_key(WORLD_PLATFORM_COIN)
-        if platform_key_result.is_err():
-            return Err(f"Could not process WORLD_PLATFORM_COIN: {platform_key_result.err_value}")
-
-        platform_mint = platform_key_result.unwrap().tobytes()
-
-        # === 1. Sync Native Platform Coin Balance ===
-        native_balance = client.get_balance(owner).value
-
-        native_asset = session.execute(
-            select(Asset).where(Asset.wallet == wallet_pk, Asset.coin == platform_mint)
-        ).scalar_one_or_none()
-
-        if native_asset:
-            if native_asset.audited_amount_sum_lamports != native_balance:
-                native_asset.audited_amount_sum_lamports = native_balance
-                native_asset.audited_time_unix_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-                updated += 1
-        else:
-            new_asset = Asset(
-                wallet=wallet_pk,
-                coin=platform_mint,
-                audited_amount_sum_lamports=native_balance,
-                audited_time_unix_ms=int(datetime.now(timezone.utc).timestamp() * 1000),
-                isNative=True,
-            )
-            session.add(new_asset)
-            created += 1
-
-        # === 2. Sync SPL Tokens (robust parsing) ===
-        try:
-            resp = client.get_token_accounts_by_owner(
-                owner,
-                opts={
-                    "program_id": Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
-                    "encoding": "jsonParsed"
-                }
-            )
-            token_accounts = resp.value
-        except Exception as e:
-            logging.warning(f"[SYNC] Could not fetch token accounts: {str(e)}")
-            token_accounts = []
-
-        for acc in token_accounts:
-            try:
-                # Handle both dict and object response styles
-                data = acc.account.data
-
-                if isinstance(data, dict):
-                    if "parsed" not in data:
-                        continue
-                    info = data["parsed"]["info"]
-                elif hasattr(data, "parsed"):
-                    info = data.parsed["info"]
-                else:
-                    continue
-
-                mint = info["mint"]
-                amount = int(info["tokenAmount"]["amount"])
-
-                # Only proceed if token exists in token_table
-                token_exists = session.execute(
-                    select(Token).where(Token.id == mint.encode())
-                ).scalar_one_or_none()
-
-                if not token_exists:
-                    continue
-
-                asset = session.execute(
-                    select(Asset).where(Asset.wallet == wallet_pk, Asset.coin == mint.encode())
-                ).scalar_one_or_none()
-
-                if asset:
-                    if asset.audited_amount_sum_lamports != amount:
-                        asset.audited_amount_sum_lamports = amount
-                        asset.audited_time_unix_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-                        updated += 1
-                else:
-                    new_asset = Asset(
-                        wallet=wallet_pk,
-                        coin=mint.encode(),
-                        audited_amount_sum_lamports=amount,
-                        audited_time_unix_ms=int(datetime.now(timezone.utc).timestamp() * 1000),
-                        isNative=False,
-                    )
-                    session.add(new_asset)
-                    created += 1
-
-            except Exception as e:
-                logging.debug(f"[SYNC] Skipped token account: {str(e)}")  # Changed to debug to reduce noise
-                continue
-
-        session.commit()
-
-        summary = {
-            "created_assets": created,
-            "updated_assets": updated,
-            "unchanged_assets": unchanged,
-        }
-        logging.info(f"[SYNC] Wallet {wallet_pk} sync complete: {summary}")
-        return Ok(summary)
-
-    except Exception as e:
-        session.rollback()
-        logging.error(f"[SYNC] Failed to sync wallet {wallet_pk}: {str(e)}")
-        return Err(str(e))
 
 
 
