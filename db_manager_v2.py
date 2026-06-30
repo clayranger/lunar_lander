@@ -163,7 +163,7 @@ class Security(Base):
 # Pydantic Schemas
 class InvestmentCreate(BaseModel):
     amount: int = Field(..., gt=0)
-    purchase_price_usdc: float = Field(..., gt=0)
+    purchase_price_usdc: float = Field(..., ge=0)
     purchase_time_ms: int
     buy_fee_native_lamports: int = Field(..., ge=0)
     buy_fee_usdc: float = Field(..., ge=0)
@@ -234,6 +234,10 @@ def get_token_key(given_key: str) -> Result:
     except Exception as e:
         return Err(f"Failed to create numpy array: {e}")
 
+def binary_token_to_mint(binary_key: bytes) -> str:
+    """Convert stored binary token key back to base58 mint address."""
+    import base58
+    return base58.b58encode(binary_key).decode("utf-8")
 
 # def get_token_key(given_key: str) -> Result[np.ndarray, str]:
 #     """
@@ -319,8 +323,8 @@ def insert_investment(
     investment_data: InvestmentCreate,
     wallet_id: Optional[int] = None,
     wallet_public_key: Optional[str] = None,
-) -> Result[bool]:
-    """Insert a new investment. Clean, session-based."""
+) -> Result[int]:
+    """Insert a new investment. Returns the new investment ID on success."""
     wallet_res = aquire_wallet_key(session, wallet_id, wallet_public_key)
     if wallet_res.is_err():
         return Err(f"Wallet error: {wallet_res.unwrap_err()}")
@@ -335,7 +339,7 @@ def insert_investment(
         inv = Investment(**data)
         session.add(inv)
         session.flush()
-        return Ok(True)
+        return Ok(inv.id)          # ← Changed from Ok(True) to Ok(inv.id)
     except Exception as exc:
         session.rollback()
         return Err(str(exc))
@@ -759,13 +763,57 @@ def execute_trade_with_gas(
     slippage_bps: int = 50,
 ) -> Result[dict]:
     """
-    Full trade orchestrator with dynamic priority fees and automatic RPC fallback.
+    Full trade orchestrator with safe control flow.
+
+    Flow:
+    1. Read-only preparation
+    2. Execute on-chain swap + confirmation first
+    3. Only then perform database mutations + commit
+    4. Auto-merge USDC positions if we received USDC
     """
     logging.info(f"[TRADE] Starting trade | investment_id={investment_id}")
 
     helius_api_key = os.getenv("HELIUS_API_KEY")
     if not helius_api_key:
         return Err("HELIUS_API_KEY not found in environment variables")
+
+    # === 1. Read-only preparation phase ===
+    inv = session.execute(
+        select(Investment).where(Investment.id == investment_id)
+    ).scalar_one_or_none()
+
+    if not inv:
+        return Err(f"Investment {investment_id} not found")
+    if inv.isClosed:
+        return Err(f"Investment {investment_id} is already closed")
+
+    asset = session.execute(
+        select(Asset).where(Asset.id == inv.parent_id)
+    ).scalar_one_or_none()
+    if not asset:
+        return Err("Asset for this Investment not found")
+
+    input_mint = binary_token_to_mint(asset.coin)
+
+    if sell_lamports is None:
+        sell_lamports = inv.amount // 2
+    if sell_lamports <= 0 or sell_lamports > inv.amount:
+        return Err("Invalid sell amount")
+
+    # Safety checks (read-only)
+    safety = pre_trade_safety_check(
+        session=session,
+        investment_id=investment_id,
+        sell_lamports=sell_lamports,
+        estimated_gas_lamports=estimated_gas_lamports,
+        wallet_pk=wallet_pk,
+    )
+    if safety.is_err():
+        return safety
+
+    gas_check = ensure_sufficient_gas(session, estimated_gas_lamports, wallet_pk)
+    if gas_check.is_err():
+        return gas_check
 
     # Load keypair
     try:
@@ -774,168 +822,123 @@ def execute_trade_with_gas(
     except Exception as e:
         return Err(f"Failed to load keypair: {str(e)}")
 
-    # Calculate priority fee once
     priority_fee = get_current_priority_fee()
+    tx_sig = None
 
+    # === 2. On-chain execution (no DB writes yet) ===
     for attempt in range(1, max_retries + 1):
         try:
-            # === Load Investment ===
-            inv = session.execute(
-                select(Investment).where(Investment.id == investment_id)
-            ).scalar_one_or_none()
+            logging.info(f"[SWAP] Attempt {attempt}/{max_retries} | Priority fee: {priority_fee}")
 
-            if not inv:
-                log_trade_result(
-                    investment_id=investment_id,
-                    wallet_pk=wallet_pk,
-                    status="failed",
-                    error_message="Investment not found",
-                    priority_fee_lamports=priority_fee,
-                )
-                return Err("Investment not found")
-
-            if sell_lamports is None:
-                sell_lamports = inv.amount // 2
-
-            if sell_lamports <= 0 or sell_lamports > inv.amount:
-                return Err("Invalid sell amount")
-
-            # === Safety + Gas checks ===
-            safety = pre_trade_safety_check(
-                session=session,
-                investment_id=investment_id,
-                sell_lamports=sell_lamports,
-                estimated_gas_lamports=estimated_gas_lamports,
-                wallet_pk=wallet_pk,
-            )
-            if safety.is_err():
-                log_trade_result(
-                    investment_id=investment_id,
-                    wallet_pk=wallet_pk,
-                    status="failed",
-                    error_message=f"Safety check failed: {safety.err_value}",
-                    priority_fee_lamports=priority_fee,
-                )
-                return Err(f"Safety check failed: {safety.err_value}")
-
-            gas_check = ensure_sufficient_gas(session, estimated_gas_lamports, wallet_pk)
-            if gas_check.is_err():
-                return gas_check
-
-            # === Get swap transaction (now uses dynamic priority fee + RPC fallback) ===
-            logging.info(f"[SWAP] Attempt {attempt}/{max_retries} | Priority fee: {priority_fee} lamports")
-
-            swap_tx_res = get_jupiter_swap_transaction(   # ← renamed function
+            swap_tx_res = get_jupiter_swap_transaction(
                 wallet_public_key=wallet_public_key,
-                input_mint=WORLD_STABLE_COIN,
+                input_mint=input_mint,
                 output_mint=target_mint,
                 amount=sell_lamports,
                 slippage_bps=slippage_bps,
             )
-
             if swap_tx_res.is_err():
-                error_msg = swap_tx_res.err_value
-                log_trade_result(
-                    investment_id=investment_id,
-                    wallet_pk=wallet_pk,
-                    status="failed",
-                    error_message=error_msg,
-                    priority_fee_lamports=priority_fee,
-                )
                 if attempt == max_retries:
-                    return Err(f"Swap failed after {max_retries} attempts: {error_msg}")
+                    return Err(f"Failed to get swap transaction: {swap_tx_res.err_value}")
                 time.sleep(2)
                 continue
 
-            tx_base64 = swap_tx_res.ok_value
-
-            # === Sign and send ===
-            send_res = sign_and_send_transaction(tx_base64, keypair)
+            send_res = sign_and_send_transaction(swap_tx_res.ok_value, keypair)
             if send_res.is_err():
-                error_msg = send_res.err_value
-                log_trade_result(
-                    investment_id=investment_id,
-                    wallet_pk=wallet_pk,
-                    status="failed",
-                    error_message=error_msg,
-                    priority_fee_lamports=priority_fee,
-                )
                 if attempt == max_retries:
-                    return Err(f"Sign/Send failed after {max_retries} attempts: {error_msg}")
+                    return Err(f"Sign/Send failed: {send_res.err_value}")
                 time.sleep(2)
                 continue
 
             tx_sig = send_res.ok_value
             logging.info(f"[SWAP] Transaction sent: {tx_sig}")
 
-            # === Confirm ===
             confirm_res = confirm_transaction(tx_sig)
             if confirm_res.is_err():
-                log_trade_result(
-                    investment_id=investment_id,
-                    wallet_pk=wallet_pk,
-                    status="failed",
-                    error_message=confirm_res.err_value,
-                    priority_fee_lamports=priority_fee,
-                )
-                return Err(f"Transaction confirmation failed: {confirm_res.err_value}")
+                if attempt == max_retries:
+                    return Err(f"Confirmation failed: {confirm_res.err_value}")
+                time.sleep(2)
+                continue
 
             logging.info(f"[CONFIRM] Transaction confirmed: {tx_sig}")
-
-            # === Record trade ===
-            record_res = record_partial_sell(
-                session=session,
-                investment_id=investment_id,
-                sold_lamports=sell_lamports,
-                sell_tx_id=tx_sig,
-                sell_price_usdc=0.0,
-            )
-            if record_res.is_err():
-                return record_res
-
-            # Spend gas + withhold tax
-            if gas_security_id:
-                spend_gas_security(session, gas_security_id, estimated_gas_lamports, tx_sig)
-
-            withhold_tax_on_profitable_sale(
-                session=session,
-                investment_id=investment_id,
-                sell_proceeds_usdc=0.0,
-                wallet_pk=wallet_pk,
-            )
-
-            # === Final success log ===
-            log_trade_result(
-                investment_id=investment_id,
-                wallet_pk=wallet_pk,
-                status="success",
-                tx_signature=tx_sig,
-                sold_lamports=sell_lamports,
-                priority_fee_lamports=priority_fee,
-            )
-
-            logging.info(f"[TRADE] Completed successfully")
-            return Ok({
-                "status": "success",
-                "investment_id": investment_id,
-                "tx_signature": tx_sig,
-                "sold_lamports": sell_lamports,
-                "priority_fee_lamports": priority_fee,
-            })
+            break
 
         except Exception as e:
-            log_trade_result(
-                investment_id=investment_id,
-                wallet_pk=wallet_pk,
-                status="failed",
-                error_message=str(e),
-                priority_fee_lamports=priority_fee,
-            )
             if attempt == max_retries:
-                return Err(f"Trade failed after {max_retries} attempts: {str(e)}")
+                return Err(f"On-chain execution failed: {str(e)}")
             time.sleep(2)
 
-    return Err(f"Trade failed after {max_retries} attempts")
+    if not tx_sig:
+        return Err("Failed to obtain a confirmed transaction signature")
+
+    # === 3. Database mutations + commit only after on-chain success ===
+    new_investment_id = None
+    try:
+        # Record sell side
+        record_partial_sell(
+            session=session,
+            investment_id=investment_id,
+            sold_lamports=sell_lamports,
+            sell_tx_id=tx_sig,
+            sell_price_usdc=0.0,
+        )
+
+        # Record buy side (new token received)
+        buy_res = record_buy_side(
+            session=session,
+            wallet_pk=wallet_pk,
+            received_mint=target_mint,
+            tx_signature=tx_sig
+        )
+        if buy_res.is_ok():
+            new_investment_id = buy_res.ok_value
+
+        # Spend gas if needed
+        if gas_security_id:
+            spend_gas_security(session, gas_security_id, estimated_gas_lamports, tx_sig)
+
+        # Withhold tax if profitable
+        withhold_tax_on_profitable_sale(
+            session=session,
+            investment_id=investment_id,
+            sell_proceeds_usdc=0.0,
+            wallet_pk=wallet_pk,
+        )
+
+        # === Auto-merge USDC if we just received USDC ===
+        if target_mint == WORLD_STABLE_COIN:
+            merge_result = merge_usdc_investments(session=session, wallet_pk=wallet_pk)
+            if merge_result.is_err():
+                logging.warning(f"[TRADE] Auto USDC merge failed: {merge_result.err_value}")
+            else:
+                logging.info(f"[TRADE] Auto-merged USDC into Investment {merge_result.ok_value}")
+
+        session.commit()
+
+    except Exception as e:
+        session.rollback()
+        return Err(f"On-chain succeeded but DB recording failed: {str(e)}")
+
+    # === Success logging ===
+    log_trade_result(
+        investment_id=investment_id,
+        wallet_pk=wallet_pk,
+        status="success",
+        tx_signature=tx_sig,
+        sold_lamports=sell_lamports,
+        priority_fee_lamports=priority_fee,
+    )
+
+    logging.info(f"[TRADE] Completed successfully")
+
+    return Ok({
+        "status": "success",
+        "investment_id": investment_id,
+        "tx_signature": tx_sig,
+        "sold_lamports": sell_lamports,
+        "new_investment_id": new_investment_id,
+        "priority_fee_lamports": priority_fee,
+    })
 
 
 
@@ -945,7 +948,8 @@ def sync_wallet_balances(
     wallet_public_key: str = None,
 ) -> Result:
     """
-    Syncs on-chain balances into the Asset table (with debug logging).
+    Syncs on-chain balances into Asset table.
+    Uses get_token_key() consistently to avoid duplicate token additions.
     """
     from rpc_client import get_solana_client
     from global_values import WORLD_PLATFORM_COIN
@@ -963,16 +967,16 @@ def sync_wallet_balances(
     updated = 0
 
     try:
-        # === 1. Native Platform Coin ===
-        platform_key = get_token_key(WORLD_PLATFORM_COIN)
-        if platform_key.is_err():
-            return Err(platform_key.err_value)
+        # === Native SOL ===
+        platform_key_res = get_token_key(WORLD_PLATFORM_COIN)
+        if platform_key_res.is_err():
+            return Err(platform_key_res.err_value)
 
-        platform_mint = platform_key.unwrap().tobytes()
+        platform_binary = platform_key_res.ok_value.tobytes()
         native_balance = client.get_balance(owner).value
 
         native_asset = session.execute(
-            select(Asset).where(Asset.wallet == wallet_pk, Asset.coin == platform_mint)
+            select(Asset).where(Asset.wallet == wallet_pk, Asset.coin == platform_binary)
         ).scalar_one_or_none()
 
         if native_asset:
@@ -983,7 +987,7 @@ def sync_wallet_balances(
         else:
             new_asset = Asset(
                 wallet=wallet_pk,
-                coin=platform_mint,
+                coin=platform_binary,
                 audited_amount_sum_lamports=native_balance,
                 audited_time_unix_ms=int(datetime.now(timezone.utc).timestamp() * 1000),
                 isNative=True,
@@ -991,80 +995,60 @@ def sync_wallet_balances(
             session.add(new_asset)
             created += 1
 
-        # === 2. SPL Tokens with Debug Logging ===
-        try:
-            resp = client.get_token_accounts_by_owner(
-                owner,
-                TokenAccountOpts(
-                    program_id=Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
-                ),
-                commitment="confirmed",
-            )
-            token_accounts = resp.value or []
-        except Exception as e:
-            logging.warning(f"[SYNC] Could not fetch token accounts: {str(e)}")
-            token_accounts = []
+        # === SPL Tokens ===
+        resp = client.get_token_accounts_by_owner(
+            owner,
+            TokenAccountOpts(program_id=Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")),
+            commitment="confirmed",
+        )
+        token_accounts = resp.value or []
 
-        print(f"\n[DEBUG] Found {len(token_accounts)} token accounts for this wallet")
-
-        for idx, acc in enumerate(token_accounts):
+        for acc in token_accounts:
             try:
                 raw = bytes(acc.account.data)
-
-                # SPL Token account layout:
-                # mint: [0:32], owner: [32:64], amount: [64:72] (u64 little-endian)
                 if len(raw) < 72:
-                    print(f"[DEBUG] [{idx}] Skipped - account data too short ({len(raw)} bytes)")
                     continue
 
                 mint_bytes = raw[0:32]
                 amount = struct.unpack_from("<Q", raw, 64)[0]
-
-                import base58
                 mint = base58.b58encode(mint_bytes).decode("utf-8")
 
-                print(f"[DEBUG] [{idx}] Found token: {mint[:8]}... amount={amount}")
+                # Use get_token_key consistently
+                token_key_res = get_token_key(mint)
+                if token_key_res.is_err():
+                    continue
 
-                # ... rest of your token_exists / asset upsert logic unchanged ...
+                token_binary = token_key_res.ok_value.tobytes()
 
-                # Check if token exists in token_table
+                # Check existence using the same binary format
                 token_exists = session.execute(
-                    select(Token).where(Token.id == mint.encode())
+                    select(Token).where(Token.id == token_binary)
                 ).scalar_one_or_none()
 
                 if not token_exists:
-                    print(f"[DEBUG] [{idx}] Token {mint[:8]} not in database - trying to add it...")
+                    decimals = 9
                     try:
-                        token_key = get_token_key(mint)
-                        if token_key.is_ok():
-                            decimals = 9
-                            try:
-                                supply = client.get_token_supply(Pubkey.from_string(mint))
-                                if supply.value and supply.value.decimals is not None:
-                                    decimals = supply.value.decimals
-                            except:
-                                pass
+                        supply_info = client.get_token_supply(Pubkey.from_string(mint))
+                        if supply_info.value and supply_info.value.decimals:
+                            decimals = supply_info.value.decimals
+                    except:
+                        pass
 
-                            new_token = Token(
-                                id=mint.encode(),
-                                name="Unknown Token",
-                                tickerSymbol="UNK",
-                                contractAddress=mint.encode(),
-                                priceServer="jupiter",
-                                exchangeSever="jupiter",
-                                decimals=decimals,
-                                price_tracking=False,
-                            )
-                            session.add(new_token)
-                            session.commit()
-                            print(f"[DEBUG] [{idx}] Successfully added unknown token: {mint[:8]}")
-                    except Exception as e:
-                        print(f"[DEBUG] [{idx}] Failed to add unknown token: {str(e)}")
-                        continue
+                    new_token = Token(
+                        id=token_binary,
+                        name=mint[:8],
+                        tickerSymbol=mint[:6],
+                        contractAddress=token_binary,
+                        priceServer="jupiter",
+                        exchangeSever="jupiter",
+                        decimals=decimals,
+                        price_tracking=False,
+                    )
+                    session.add(new_token)
 
-                # Create or update Asset
+                # Asset handling
                 asset = session.execute(
-                    select(Asset).where(Asset.wallet == wallet_pk, Asset.coin == mint.encode())
+                    select(Asset).where(Asset.wallet == wallet_pk, Asset.coin == token_binary)
                 ).scalar_one_or_none()
 
                 if asset:
@@ -1072,32 +1056,26 @@ def sync_wallet_balances(
                         asset.audited_amount_sum_lamports = amount
                         asset.audited_time_unix_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
                         updated += 1
-                        print(f"[DEBUG] [{idx}] Updated existing Asset for {mint[:8]}")
                 else:
                     new_asset = Asset(
                         wallet=wallet_pk,
-                        coin=mint.encode(),
+                        coin=token_binary,
                         audited_amount_sum_lamports=amount,
                         audited_time_unix_ms=int(datetime.now(timezone.utc).timestamp() * 1000),
                         isNative=False,
                     )
                     session.add(new_asset)
                     created += 1
-                    print(f"[DEBUG] [{idx}] Created NEW Asset for token: {mint[:8]}")
 
             except Exception as e:
-                print(f"[DEBUG] [{idx}] Error processing account: {str(e)}")
+                logging.warning(f"[SYNC] Token account error: {str(e)}")
                 continue
 
         session.commit()
-        summary = {"created_assets": created, "updated_assets": updated}
-        print(f"\n[DEBUG] Final summary: {summary}")
-        logging.info(f"[SYNC] Wallet {wallet_pk} sync complete: {summary}")
-        return Ok(summary)
+        return Ok({"created_assets": created, "updated_assets": updated})
 
     except Exception as e:
         session.rollback()
-        logging.error(f"[SYNC] Failed to sync wallet {wallet_pk}: {str(e)}")
         return Err(str(e))
 
 
@@ -1357,17 +1335,21 @@ def execute_sell_percentage_investment(
     slippage_bps: int = 50,
 ) -> Result[dict]:
     """
-    Sells a percentage of an investment.
-    Cleanly exposes slippage_bps and uses the latest trade engine.
+    Sells a percentage of an Investment and swaps it to another token (e.g. USDC).
+
+    Safer flow:
+    - Validates and calculates in read-only mode first
+    - Delegates to execute_trade_with_gas (which handles on-chain first, then DB commit)
+    - Returns useful data on success (tx_signature, new_investment_id, etc.)
     """
     if wallet_pk is None:
         single = get_single_wallet_pk(session)
         if single.is_ok() and single.value:
             wallet_pk = single.value
         else:
-            return Err("wallet_pk not provided and no default wallet could be determined")
+            return Err("Could not determine wallet_pk")
 
-    # Load the investment
+    # === Read-only validation phase ===
     inv = session.execute(
         select(Investment).where(Investment.id == investment_id)
     ).scalar_one_or_none()
@@ -1382,11 +1364,11 @@ def execute_sell_percentage_investment(
         return Err("sell_percentage must be between 0 and 100")
 
     sell_lamports = int(inv.amount * (sell_percentage / 100))
-
     if sell_lamports <= 0:
         return Err("Calculated sell amount is zero or negative")
 
-    # Call the main trade engine
+    # === Delegate to the core trade function ===
+    # (execute_trade_with_gas now handles on-chain first + DB commit/rollback internally)
     return execute_trade_with_gas(
         session=session,
         investment_id=investment_id,
@@ -2246,3 +2228,125 @@ def get_recent_swap_signatures(
         return Err(str(e))
     finally:
         session.close()
+
+
+def record_buy_side(
+    session: Session,
+    wallet_pk: int,
+    received_mint: str,
+    tx_signature: str,
+    received_amount: int = None
+) -> Result[int]:
+    """
+    Records the token received from a successful swap as a new Investment.
+    Returns the actual new investment_id on success.
+    """
+    from db_manager_v2 import get_jupiter_swap_details
+
+    if received_amount is None or received_amount <= 0:
+        details_res = get_jupiter_swap_details(tx_signature)
+        if details_res.is_err():
+            return details_res
+
+        changes = details_res.ok_value.get("token_changes", {})
+        received_amount = changes.get(received_mint, 0)
+
+        if received_amount <= 0:
+            return Err(f"Could not determine received amount for {received_mint}")
+
+    key_res = get_token_key(received_mint)
+    if key_res.is_err():
+        return key_res
+    token_key = key_res.ok_value
+
+    investment_data = InvestmentCreate(
+        amount=received_amount,
+        purchase_price_usdc=0.0,
+        purchase_time_ms=int(time.time() * 1000),
+        buy_fee_native_lamports=0,
+        buy_fee_usdc=0.0,
+        buy_tx_id=tx_signature,
+    )
+
+    result = insert_investment(
+        session=session,
+        token_key=token_key,
+        investment_data=investment_data,
+        wallet_id=wallet_pk
+    )
+
+    if result.is_err():
+        return result
+
+    new_investment_id = result.ok_value   # This is now the real ID
+    logging.info(f"[TRADE] Created buy-side Investment {new_investment_id} for {received_mint[:8]}...")
+
+    return Ok(new_investment_id)
+
+
+def merge_usdc_investments(
+    session: Session,
+    wallet_pk: int
+) -> Result[int]:
+    """
+    Merges all open USDC (WORLD_STABLE_COIN) Investments into a single one.
+    Useful for tax simplicity and for easily spending your full USDC balance.
+
+    Returns the ID of the new consolidated Investment.
+    Old USDC Investments are closed with a 'merge' marker.
+    """
+    from global_values import WORLD_STABLE_COIN
+
+    # Get the binary key for USDC
+    usdc_key_res = get_token_key(WORLD_STABLE_COIN)
+    if usdc_key_res.is_err():
+        return usdc_key_res
+    usdc_binary = usdc_key_res.ok_value.tobytes()
+
+    # Find all open USDC Investments
+    usdc_investments = session.execute(
+        select(Investment)
+        .join(Asset, Investment.parent_id == Asset.id)
+        .where(
+            Asset.wallet == wallet_pk,
+            Asset.coin == usdc_binary,
+            Investment.isClosed == False
+        )
+    ).scalars().all()
+
+    if not usdc_investments:
+        return Err("No open USDC Investments found to merge")
+
+    if len(usdc_investments) == 1:
+        return Ok(usdc_investments[0].id)  # Already only one
+
+    # Calculate total amount
+    total_amount = sum(inv.amount for inv in usdc_investments)
+
+    # Get the Asset ID (they should all share the same Asset)
+    asset_id = usdc_investments[0].parent_id
+
+    # Create new consolidated Investment
+    merged_inv = Investment(
+        parent_id=asset_id,
+        amount=total_amount,
+        purchase_price_usdc=0.0,           # You can improve this later if needed
+        purchase_time_ms=int(time.time() * 1000),
+        buy_fee_native_lamports=0,
+        buy_fee_usdc=0.0,
+        buy_tx_id="merge_usdc_investments",
+        isClosed=False,
+    )
+    session.add(merged_inv)
+    session.flush()
+
+    # Close all old USDC Investments
+    for old_inv in usdc_investments:
+        old_inv.isClosed = True
+        old_inv.sell_tx_id = "merge_usdc_investments"
+        old_inv.sale_time_ms = int(time.time() * 1000)
+
+    session.commit()
+
+    logging.info(f"[MERGE] Merged {len(usdc_investments)} USDC Investments into Investment {merged_inv.id}")
+    return Ok(merged_inv.id)
