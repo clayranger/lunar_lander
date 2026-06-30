@@ -26,7 +26,7 @@ from solders.pubkey import Pubkey
 from solana.rpc.api import Client
 import os
 import time
-
+from db_manager_v2 import Asset, Investment, Security, Token
 
 def create_tables() -> Result:
     """Create all database tables if they don't exist."""
@@ -245,3 +245,205 @@ def full_dev_setup(public_key: Optional[str] = None) -> Result:
 
     logging.info("[SETUP] Full development setup completed")
     return Ok(results)
+def add_missing_tokens() -> Result:
+    """
+    Adds any new tokens from global_values.solana_tokens that are not yet in the database.
+    Safe to run multiple times.
+    """
+    from rpc_client import get_solana_client
+    from global_values import solana_tokens
+
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    client = get_solana_client()
+
+    added = 0
+    skipped = 0
+    failed = 0
+
+    try:
+        for mint_address in solana_tokens:
+            try:
+                token_key = get_token_key(mint_address)
+                if token_key.is_err():
+                    failed += 1
+                    continue
+
+                token_id = token_key.unwrap().tobytes()
+
+                # Skip if token already exists
+                if session.execute(select(Token).where(Token.id == token_id)).scalar_one_or_none():
+                    skipped += 1
+                    continue
+
+                # Get correct decimals
+                decimals = 9
+                try:
+                    supply_resp = client.get_token_supply(Pubkey.from_string(mint_address))
+                    if supply_resp.value and supply_resp.value.decimals is not None:
+                        decimals = supply_resp.value.decimals
+                except Exception as e:
+                    logging.warning(f"Could not fetch decimals for {mint_address[:8]}: {str(e)}")
+
+                new_token = Token(
+                    id=token_id,
+                    name="Unknown",
+                    tickerSymbol="UNK",
+                    contractAddress=token_id,
+                    priceServer="jupiter",
+                    exchangeSever="jupiter",
+                    decimals=decimals,
+                    price_tracking=True,
+                )
+
+                session.add(new_token)
+                session.commit()
+                added += 1
+                logging.info(f"Added new token: {mint_address[:8]} (decimals={decimals})")
+
+            except Exception as e:
+                logging.error(f"Failed to add token {mint_address[:8]}: {str(e)}")
+                session.rollback()
+                failed += 1
+
+        summary = {"added": added, "skipped": skipped, "failed": failed}
+        logging.info(f"[TOKENS] Missing tokens sync complete: {summary}")
+        return Ok(summary)
+
+    except Exception as e:
+        session.rollback()
+        return Err(str(e))
+    finally:
+        session.close()
+
+def reconcile_onchain_to_securities(wallet_pk: int) -> Result:
+    """
+    Reconciles on-chain balances with the database.
+    Creates/updates Savings Securities for any money not yet accounted for
+    in Investments or Securities. Handles all assets (including unknown tokens).
+    """
+    from rpc_client import get_solana_client
+    from sqlalchemy import select, func
+    from db_manager_v2 import Asset, Investment, Security, Token   # ← Added this line
+    from global_values import WORLD_PLATFORM_COIN
+
+    client = get_solana_client()
+
+    # Step 1: Sync latest on-chain balances
+    sync_result = sync_wallet_balances(session=sessionmaker(bind=engine)(), wallet_pk=wallet_pk)
+    if sync_result.is_err():
+        return sync_result
+
+    Session = sessionmaker(bind=engine)
+    session = Session()
+
+    summary = {
+        "assets_processed": 0,
+        "securities_created": 0,
+        "securities_updated": 0,
+        "unknown_tokens_added": 0,
+        "unknown_tokens_failed": 0,
+    }
+
+    try:
+        assets = session.execute(
+            select(Asset).where(Asset.wallet == wallet_pk)
+        ).scalars().all()
+
+        for asset in assets:
+            summary["assets_processed"] += 1
+            onchain_amount = asset.audited_amount_sum_lamports or 0
+
+            accounted_investments = session.execute(
+                select(func.sum(Investment.amount)).where(
+                    Investment.parent_id == asset.id,
+                    Investment.isClosed == False
+                )
+            ).scalar() or 0
+
+            accounted_securities = session.execute(
+                select(func.sum(Security.amount)).where(
+                    Security.parent_id == asset.id,
+                    Security.isClosed == False
+                )
+            ).scalar() or 0
+
+            accounted_total = accounted_investments + accounted_securities
+            unaccounted = onchain_amount - accounted_total
+
+            if unaccounted <= 0:
+                continue
+
+            # Try to add unknown token if needed
+            token = session.execute(
+                select(Token).where(Token.id == asset.coin)
+            ).scalar_one_or_none()
+
+            if not token:
+                try:
+                    mint_str = asset.coin.decode() if isinstance(asset.coin, bytes) else str(asset.coin)
+                    token_key = get_token_key(mint_str)
+                    if token_key.is_ok():
+                        decimals = 9
+                        try:
+                            supply = client.get_token_supply(Pubkey.from_string(mint_str))
+                            if supply.value and supply.value.decimals:
+                                decimals = supply.value.decimals
+                        except:
+                            pass
+
+                        new_token = Token(
+                            id=asset.coin,
+                            name="Unknown Token",
+                            tickerSymbol="UNK",
+                            contractAddress=asset.coin,
+                            priceServer="jupiter",
+                            exchangeSever="jupiter",
+                            decimals=decimals,
+                            price_tracking=False,
+                        )
+                        session.add(new_token)
+                        session.commit()
+                        summary["unknown_tokens_added"] += 1
+                        logging.info(f"[RECONCILE] Added unknown token: {mint_str[:8]}")
+                except Exception as e:
+                    summary["unknown_tokens_failed"] += 1
+                    logging.warning(f"[RECONCILE] Failed to add unknown token: {str(e)}")
+
+            # Find or create Savings Security
+            savings_sec = session.execute(
+                select(Security).where(
+                    Security.parent_id == asset.id,
+                    Security.isClosed == False,
+                    Security.isSavings == True
+                )
+            ).scalar_one_or_none()
+
+            if not savings_sec:
+                savings_sec = Security(
+                    parent_id=asset.id,
+                    amount=0,
+                    purchase_price_usdc=0.0,
+                    purchase_time_ms=int(time.time() * 1000),
+                    buy_fee_native_lamports=0,
+                    buy_fee_usdc=0.0,
+                    buy_tx_id=f"reconcile_{wallet_pk}_{int(time.time())}",
+                    isClosed=False,
+                    isSavings=True,
+                )
+                session.add(savings_sec)
+                summary["securities_created"] += 1
+            else:
+                summary["securities_updated"] += 1
+
+            savings_sec.amount += unaccounted
+
+        session.commit()
+        logging.info(f"[RECONCILE] Reconciliation complete for wallet {wallet_pk}: {summary}")
+        return Ok(summary)
+
+    except Exception as e:
+        session.rollback()
+        return Err(str(e))
+    finally:
+        session.close()

@@ -10,7 +10,7 @@ Design goals:
 
 from __future__ import annotations
 from dotenv import load_dotenv
-
+import struct
 from typing import List, Optional, Dict, Any
 import numpy as np
 import base58
@@ -45,10 +45,11 @@ import json
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 from solders.pubkey import Pubkey          # ← Add this line
-
+from solana.rpc.types import TokenAccountOpts
+from solders.signature import Signature
 from solana.rpc.api import Client
 from solana.rpc.commitment import Commitment
-
+from solana.rpc.types import TxOpts
 from datetime import datetime, timezone
 Base = declarative_base()
 
@@ -57,6 +58,7 @@ load_dotenv()
 setup_logging(log_file="trades.log")
 
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
+JUPITER_API_KEY = os.getenv("JUPITER_API_KEY")
 
 # =============================================================================
 # 1. MODELS & SCHEMAS
@@ -627,27 +629,46 @@ def get_jupiter_swap_transaction(
     amount: int,
     slippage_bps: int = 50,
 ) -> Result[str]:
-    client = get_solana_client()
     priority_fee = get_current_priority_fee()
 
-    # You can keep using Helius API for Jupiter swaps even if using Alchemy for RPC
-    helius_api_key = os.getenv("HELIUS_API_KEY")
-    url = f"https://api.helius.xyz/v0/transactions/swap?api-key={helius_api_key}"
+    jupiter_api_key = JUPITER_API_KEY
+    if not jupiter_api_key:
+        return Err("JUPITER_API_KEY not found in environment variables — get a free key at portal.jup.ag")
 
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": jupiter_api_key,                 #  Correct header format
+    }
+
+    # Step 1: Get a quote from Jupiter (new api.jup.ag domain, paths unchanged)
+    quote_url = f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}"
+
+    try:
+        quote_response = requests.get(quote_url, headers=headers, timeout=15)
+        logging.info(f"STATUS: {quote_response.status_code}")
+        logging.info(f"BODY: {quote_response.text}")
+        quote_response.raise_for_status()
+        quote_data = quote_response.json()
+        # For Free Tier
+        time.sleep(1.1)
+    except Exception as e:
+        return Err(f"Jupiter quote request failed: {str(e)}")
+
+    # Step 2: Request the swap transaction
+    # Free devel
+    # swap_url = "https://api.jup.ag/swap/v1/swap"
+    swap_url = "https://lite-api.jup.ag/swap/v1/swap"
     payload = {
-        "quoteResponse": {
-            "inputMint": input_mint,
-            "outputMint": output_mint,
-            "amount": str(amount),
-            "slippageBps": slippage_bps,
-        },
+        "quoteResponse": quote_data,
         "userPublicKey": wallet_public_key,
         "prioritizationFeeLamports": priority_fee,
         "wrapAndUnwrapSol": True,
     }
 
     try:
-        response = requests.post(url, json=payload, timeout=30)
+        response = requests.post(swap_url, json=payload, headers=headers, timeout=30)
+        logging.info(f"STATUS: {quote_response.status_code}")
+        logging.info(f"BODY: {quote_response.text}")
         response.raise_for_status()
         data = response.json()
         tx_base64 = data.get("swapTransaction")
@@ -676,7 +697,10 @@ def sign_and_send_transaction(
 
         result = client.send_transaction(
             signed_tx,
-            opts={"skip_preflight": False, "preflight_commitment": Commitment("confirmed")}
+            opts=TxOpts(
+                skip_preflight=False,
+                preflight_commitment=Commitment("confirmed"),
+            )
         )
         return Ok(str(result.value))
     except Exception as e:
@@ -698,9 +722,9 @@ def confirm_transaction(
     for attempt in range(max_retries):
         try:
             response = client.get_transaction(
-                tx_signature,
+                Signature.from_string(tx_signature),
                 commitment=Commitment("confirmed"),
-                max_supported_transaction_version=0
+                max_supported_transaction_version=0,
             )
 
             if response.value:
@@ -914,14 +938,14 @@ def execute_trade_with_gas(
     return Err(f"Trade failed after {max_retries} attempts")
 
 
+
 def sync_wallet_balances(
     session: Session,
     wallet_pk: int,
     wallet_public_key: str = None,
 ) -> Result:
     """
-    Syncs on-chain balances into the Asset table.
-    Uses dynamic RPC client (with automatic fallback).
+    Syncs on-chain balances into the Asset table (with debug logging).
     """
     from rpc_client import get_solana_client
     from global_values import WORLD_PLATFORM_COIN
@@ -939,7 +963,7 @@ def sync_wallet_balances(
     updated = 0
 
     try:
-        # === 1. Sync Native Platform Coin (SOL or future native coin) ===
+        # === 1. Native Platform Coin ===
         platform_key = get_token_key(WORLD_PLATFORM_COIN)
         if platform_key.is_err():
             return Err(platform_key.err_value)
@@ -967,49 +991,78 @@ def sync_wallet_balances(
             session.add(new_asset)
             created += 1
 
-        # === 2. Sync SPL Tokens (robust parsing) ===
+        # === 2. SPL Tokens with Debug Logging ===
         try:
             resp = client.get_token_accounts_by_owner(
                 owner,
-                opts={
-                    "program_id": Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
-                    "encoding": "jsonParsed"
-                }
+                TokenAccountOpts(
+                    program_id=Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
+                ),
+                commitment="confirmed",
             )
             token_accounts = resp.value or []
         except Exception as e:
             logging.warning(f"[SYNC] Could not fetch token accounts: {str(e)}")
             token_accounts = []
 
-        for acc in token_accounts:
+        print(f"\n[DEBUG] Found {len(token_accounts)} token accounts for this wallet")
+
+        for idx, acc in enumerate(token_accounts):
             try:
-                data = acc.account.data
+                raw = bytes(acc.account.data)
 
-                # Handle both dict and object response styles safely
-                if isinstance(data, dict):
-                    parsed = data.get("parsed")
-                    if not parsed:
-                        continue
-                    info = parsed.get("info", {})
-                elif hasattr(data, "parsed"):
-                    info = getattr(data.parsed, "info", {}) or {}
-                else:
+                # SPL Token account layout:
+                # mint: [0:32], owner: [32:64], amount: [64:72] (u64 little-endian)
+                if len(raw) < 72:
+                    print(f"[DEBUG] [{idx}] Skipped - account data too short ({len(raw)} bytes)")
                     continue
 
-                mint = info.get("mint")
-                token_amount = info.get("tokenAmount", {})
-                if not mint or not token_amount:
-                    continue
+                mint_bytes = raw[0:32]
+                amount = struct.unpack_from("<Q", raw, 64)[0]
 
-                amount = int(token_amount.get("amount", 0))
+                import base58
+                mint = base58.b58encode(mint_bytes).decode("utf-8")
 
-                # Only process tokens that exist in our token_table
+                print(f"[DEBUG] [{idx}] Found token: {mint[:8]}... amount={amount}")
+
+                # ... rest of your token_exists / asset upsert logic unchanged ...
+
+                # Check if token exists in token_table
                 token_exists = session.execute(
                     select(Token).where(Token.id == mint.encode())
                 ).scalar_one_or_none()
-                if not token_exists:
-                    continue
 
+                if not token_exists:
+                    print(f"[DEBUG] [{idx}] Token {mint[:8]} not in database - trying to add it...")
+                    try:
+                        token_key = get_token_key(mint)
+                        if token_key.is_ok():
+                            decimals = 9
+                            try:
+                                supply = client.get_token_supply(Pubkey.from_string(mint))
+                                if supply.value and supply.value.decimals is not None:
+                                    decimals = supply.value.decimals
+                            except:
+                                pass
+
+                            new_token = Token(
+                                id=mint.encode(),
+                                name="Unknown Token",
+                                tickerSymbol="UNK",
+                                contractAddress=mint.encode(),
+                                priceServer="jupiter",
+                                exchangeSever="jupiter",
+                                decimals=decimals,
+                                price_tracking=False,
+                            )
+                            session.add(new_token)
+                            session.commit()
+                            print(f"[DEBUG] [{idx}] Successfully added unknown token: {mint[:8]}")
+                    except Exception as e:
+                        print(f"[DEBUG] [{idx}] Failed to add unknown token: {str(e)}")
+                        continue
+
+                # Create or update Asset
                 asset = session.execute(
                     select(Asset).where(Asset.wallet == wallet_pk, Asset.coin == mint.encode())
                 ).scalar_one_or_none()
@@ -1019,6 +1072,7 @@ def sync_wallet_balances(
                         asset.audited_amount_sum_lamports = amount
                         asset.audited_time_unix_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
                         updated += 1
+                        print(f"[DEBUG] [{idx}] Updated existing Asset for {mint[:8]}")
                 else:
                     new_asset = Asset(
                         wallet=wallet_pk,
@@ -1029,13 +1083,15 @@ def sync_wallet_balances(
                     )
                     session.add(new_asset)
                     created += 1
+                    print(f"[DEBUG] [{idx}] Created NEW Asset for token: {mint[:8]}")
 
             except Exception as e:
-                logging.debug(f"[SYNC] Skipped token account: {str(e)}")
+                print(f"[DEBUG] [{idx}] Error processing account: {str(e)}")
                 continue
 
         session.commit()
         summary = {"created_assets": created, "updated_assets": updated}
+        print(f"\n[DEBUG] Final summary: {summary}")
         logging.info(f"[SYNC] Wallet {wallet_pk} sync complete: {summary}")
         return Ok(summary)
 
@@ -1043,7 +1099,6 @@ def sync_wallet_balances(
         session.rollback()
         logging.error(f"[SYNC] Failed to sync wallet {wallet_pk}: {str(e)}")
         return Err(str(e))
-
 
 
 
@@ -1781,3 +1836,26 @@ def return_investment_to_savings(
         investment_id=investment_id,
         amount_lamports=amount_lamports,
     )
+
+
+def pre_trade_safety_check(
+    session: Session,
+    investment_id: int,
+    sell_lamports: int,
+    estimated_gas_lamports: int,
+    wallet_pk: int = None
+) -> Result[bool]:
+    """
+    Basic safety check before trading.
+    Currently a placeholder that always passes.
+    """
+    try:
+        # TODO: Add real checks later (enough balance, enough gas, etc.)
+        if sell_lamports <= 0:
+            return Err("Sell amount must be greater than zero")
+
+        # For now we just approve the trade
+        return Ok(True)
+
+    except Exception as e:
+        return Err(str(e))
