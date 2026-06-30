@@ -24,7 +24,7 @@ from contextlib import contextmanager
 
 from sqlalchemy import create_engine, select, func
 from sqlalchemy.dialects.postgresql import BYTEA
-from sqlalchemy.orm import Session, declarative_base, Mapped, mapped_column, relationship
+from sqlalchemy.orm import Session, declarative_base, Mapped, mapped_column, relationship, sessionmaker
 from sqlalchemy import Integer, String, Boolean, BigInteger, LargeBinary, Float, ForeignKey, cast
 
 from pydantic import BaseModel, Field
@@ -1859,3 +1859,390 @@ def pre_trade_safety_check(
 
     except Exception as e:
         return Err(str(e))
+
+
+def reconcile_recent_trades(
+    wallet_pk: int,
+    lookback_minutes: int = 60
+) -> Result[dict]:
+    """
+    Scans recent on-chain activity and repairs the database for trades
+    that succeeded on-chain but were not properly recorded.
+
+    This version uses repair_investment_from_tx internally for consistency.
+    """
+    from rpc_client import get_solana_client
+    from solders.signature import Signature
+    from datetime import datetime, timedelta, timezone
+
+    client = get_solana_client()
+
+    wallet = session.execute(select(Wallet).where(Wallet.id == wallet_pk)).scalar_one_or_none()
+    if not wallet:
+        return Err("Wallet not found")
+
+    wallet_pubkey = Pubkey.from_string(wallet.publicKey)
+    since = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
+
+    repaired = 0
+    errors = 0
+
+    try:
+        sigs_resp = client.get_signatures_for_address(wallet_pubkey, limit=50)
+
+        if not sigs_resp.value:
+            return Ok({"repaired": 0, "message": "No recent transactions found"})
+
+        for sig_info in sigs_resp.value:
+            if sig_info.err is not None:
+                continue
+
+            tx_sig = str(sig_info.signature)
+
+            if sig_info.block_time:
+                tx_time = datetime.fromtimestamp(sig_info.block_time, tz=timezone.utc)
+                if tx_time < since:
+                    continue
+
+            try:
+                tx_resp = client.get_transaction(
+                    Signature.from_string(tx_sig),
+                    commitment=Commitment("confirmed"),
+                    max_supported_transaction_version=0,
+                )
+
+                if not tx_resp.value or tx_resp.value.transaction.meta is None:
+                    continue
+
+                meta = tx_resp.value.transaction.meta
+                if meta.err is not None:
+                    continue
+
+                logs = meta.log_messages or []
+                is_jupiter_swap = any("Jupiter" in log for log in logs)
+
+                if not is_jupiter_swap:
+                    continue
+
+                # Find open investments that haven't been marked as sold yet
+                open_investments = session.execute(
+                    select(Investment)
+                    .join(Asset, Investment.parent_id == Asset.id)
+                    .where(
+                        Asset.wallet == wallet_pk,
+                        Investment.isClosed == False,
+                        Investment.sell_tx_id.is_(None)
+                    )
+                ).scalars().all()
+
+                for inv in open_investments:
+                    # Use the dedicated repair function for consistency
+                    repair_result = repair_investment_from_tx(
+                        session=session,
+                        investment_id=inv.id,
+                        tx_signature=tx_sig,
+                        sold_lamports=None  # Fully close for now (conservative)
+                    )
+
+                    if repair_result.is_ok() and repair_result.ok_value:
+                        repaired += 1
+                        logging.info(f"[RECONCILE] Repaired Investment {inv.id} via tx {tx_sig}")
+
+            except Exception as e:
+                logging.warning(f"[RECONCILE] Error processing tx {tx_sig}: {str(e)}")
+                errors += 1
+                continue
+
+        session.commit()
+        return Ok({
+            "repaired": repaired,
+            "errors": errors,
+            "lookback_minutes": lookback_minutes
+        })
+
+    except Exception as e:
+        session.rollback()
+        return Err(str(e))
+
+
+def repair_investment_from_tx(
+    session: Session,
+    investment_id: int,
+    tx_signature: str,
+    sold_lamports: int = None
+) -> Result[bool]:
+    """
+    Repairs a single investment record using a known successful transaction signature.
+
+    Use this when a trade succeeded on-chain but wasn't recorded properly in the database.
+    """
+    try:
+        inv = session.execute(
+            select(Investment).where(Investment.id == investment_id)
+        ).scalar_one_or_none()
+
+        if not inv:
+            return Err(f"Investment {investment_id} not found")
+
+        if inv.isClosed:
+            return Ok(False)  # Already closed, nothing to do
+
+        # Determine how much was sold
+        if sold_lamports is None:
+            sold_lamports = inv.amount  # Full close
+
+        if sold_lamports > inv.amount:
+            return Err(f"Cannot sell more than available ({inv.amount} lamports)")
+
+        remaining = inv.amount - sold_lamports
+
+        # Update the sold portion
+        inv.amount = sold_lamports
+        inv.isClosed = True
+        inv.sell_tx_id = tx_signature
+        inv.sale_time_ms = int(time.time() * 1000)
+        inv.sale_price_usdc = 0.0
+
+        # If there is remaining amount, create a new open investment
+        if remaining > 0:
+            new_inv = Investment(
+                parent_id=inv.parent_id,
+                amount=remaining,
+                purchase_price_usdc=inv.purchase_price_usdc,
+                purchase_time_ms=inv.purchase_time_ms,
+                buy_fee_native_lamports=inv.buy_fee_native_lamports,
+                buy_fee_usdc=inv.buy_fee_usdc,
+                buy_tx_id=inv.buy_tx_id,
+                isClosed=False,
+            )
+            session.add(new_inv)
+
+        session.commit()
+
+        logging.info(
+            f"[REPAIR] Repaired Investment {investment_id} | "
+            f"sold={sold_lamports}, remaining={remaining}, tx={tx_signature}"
+        )
+
+        return Ok(True)
+
+    except Exception as e:
+        session.rollback()
+        return Err(str(e))
+
+
+def get_jupiter_swap_details(tx_signature: str) -> Result[dict]:
+    """
+    Fetches a Jupiter swap transaction and returns clean, structured details.
+    Focuses on net token changes for the user's wallet.
+    """
+    helius_api_key = os.getenv("HELIUS_API_KEY")
+    if not helius_api_key:
+        return Err("HELIUS_API_KEY not found")
+
+    url = f"https://mainnet.helius-rpc.com/?api-key={helius_api_key}"
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTransaction",
+        "params": [
+            tx_signature,
+            {
+                "encoding": "jsonParsed",
+                "maxSupportedTransactionVersion": 0,
+                "commitment": "confirmed"
+            }
+        ]
+    }
+
+    try:
+        resp = requests.post(url, json=payload, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if "error" in data:
+            return Err(str(data["error"]))
+
+        tx = data.get("result")
+        if not tx:
+            return Err("Transaction not found")
+
+        meta = tx.get("meta", {})
+        if meta.get("err"):
+            return Err(f"Transaction failed: {meta['err']}")
+
+        # Get user's wallet from the transaction
+        account_keys = tx.get("transaction", {}).get("message", {}).get("accountKeys", [])
+        user_wallet = None
+        for acc in account_keys:
+            if isinstance(acc, dict) and acc.get("signer"):
+                user_wallet = acc.get("pubkey")
+                break
+
+        # Analyze token balance changes
+        pre_balances = {b["mint"]: int(b["uiTokenAmount"]["amount"])
+                        for b in meta.get("preTokenBalances", []) if b.get("owner") == user_wallet}
+        post_balances = {b["mint"]: int(b["uiTokenAmount"]["amount"])
+                         for b in meta.get("postTokenBalances", []) if b.get("owner") == user_wallet}
+
+        changes = {}
+        all_mints = set(pre_balances.keys()) | set(post_balances.keys())
+
+        for mint in all_mints:
+            before = pre_balances.get(mint, 0)
+            after = post_balances.get(mint, 0)
+            diff = after - before
+            if diff != 0:
+                changes[mint] = diff
+
+        return Ok({
+            "signature": tx_signature,
+            "slot": tx.get("slot"),
+            "block_time": tx.get("blockTime"),
+            "user_wallet": user_wallet,
+            "token_changes": changes,           # ← Clean summary of what was bought/sold
+            "success": True
+        })
+
+    except Exception as e:
+        return Err(f"Failed to parse transaction: {str(e)}")
+
+
+
+def recover_trade_from_tx(
+    tx_signature: str,
+    wallet_pk: int = None
+) -> Result[dict]:
+    """
+    Recovers/repairs an investment using on-chain data.
+    More tolerant of messy database states during development.
+    """
+    from db_manager_v2 import get_jupiter_swap_details
+
+    SessionLocal = sessionmaker(bind=engine)
+    session = SessionLocal()
+
+    try:
+        # === Global duplicate check ===
+        existing = session.execute(
+            select(Investment).where(Investment.sell_tx_id == tx_signature)
+        ).scalars().first()
+
+        if existing:
+            return Ok({
+                "status": "already_recorded",
+                "investment_id": existing.id,
+                "message": "This transaction was already recorded"
+            })
+
+        # === Get swap details ===
+        details_res = get_jupiter_swap_details(tx_signature)
+        if details_res.is_err():
+            return details_res
+
+        details = details_res.ok_value
+        token_changes = details.get("token_changes", {})
+
+        if not token_changes:
+            return Err("No token changes found")
+
+        # Find sold token
+        sold_mint = None
+        sold_amount = 0
+        for mint, change in token_changes.items():
+            if change < 0 and abs(change) > abs(sold_amount):
+                sold_mint = mint
+                sold_amount = abs(change)
+
+        if sold_amount == 0:
+            return Err("Could not determine sold amount")
+
+        # Find open investments
+        open_investments = session.execute(
+            select(Investment)
+            .join(Asset, Investment.parent_id == Asset.id)
+            .where(
+                Asset.wallet == wallet_pk,
+                Investment.isClosed == False,
+                Investment.sell_tx_id.is_(None)
+            )
+        ).scalars().all()
+
+        if not open_investments:
+            return Err("No open investments to repair")
+
+        target = open_investments[0]
+
+        # Repair
+        repair_res = repair_investment_from_tx(
+            session=session,
+            investment_id=target.id,
+            tx_signature=tx_signature,
+            sold_lamports=sold_amount
+        )
+
+        if repair_res.is_err():
+            return repair_res
+
+        return Ok({
+            "status": "recovered",
+            "investment_id": target.id,
+            "tx_signature": tx_signature,
+            "sold_lamports": sold_amount,
+            "sold_mint": sold_mint
+        })
+
+    except Exception as e:
+        session.rollback()
+        return Err(str(e))
+    finally:
+        session.close()
+
+
+def get_recent_swap_signatures(
+    wallet_pk: int,
+    limit: int = 30
+) -> Result[list[str]]:
+    """
+    Returns recent transaction signatures for a wallet.
+    Creates its own session internally.
+    """
+    from rpc_client import get_solana_client
+    from sqlalchemy.orm import sessionmaker
+
+    client = get_solana_client()
+    SessionLocal = sessionmaker(bind=engine)
+    session = SessionLocal()
+
+    try:
+        # Get wallet public key
+        wallet = session.execute(
+            select(Wallet).where(Wallet.id == wallet_pk)
+        ).scalar_one_or_none()
+
+        if not wallet:
+            return Err("Wallet not found")
+
+        # Get recent signatures
+        resp = client.get_signatures_for_address(
+            Pubkey.from_string(wallet.publicKey),
+            limit=limit
+        )
+
+        if not resp.value:
+            return Ok([])
+
+        # Return only successful transactions
+        signatures = [
+            str(sig.signature)
+            for sig in resp.value
+            if sig.err is None
+        ]
+
+        return Ok(signatures)
+
+    except Exception as e:
+        return Err(str(e))
+    finally:
+        session.close()
