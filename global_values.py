@@ -10,7 +10,7 @@ solana_tokens = [
     '3B5wuUrMEi5yATD7on46hKfej3pfmd7t1RKgrsN3pump',
     'Ez3nzG9ofodYCvEmw73XhQ87LWNYVRM2s7diB5tBZPyM',
     '4vMsoUT2BWatFweudnQM1xedRLfJgJ7hswhcpz4xgBTy',
-    'UXPhBoR3qG4UCiGNJfV7MqhHyFqKN68g45GoYvAeL2M',
+    'UXPhBoR3qG4UCiGNJfV7MqhHyFqKN68g45GoYvAeL2M', #LOOKS DEAD
     'METAewgxyPbgwsseH8T16a39CQ5VyVxZi9zXiDPY18m',
     'CaGa7pddFXS65Gznqwp42kBhkJQdceoFVT7AQYo8Jr8Q',
     'CTJf74cTo3cw8acFP1YXF3QpsQUUBGBjh2k2e8xsZ6UL',
@@ -33,7 +33,7 @@ solana_tokens = [
     'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
     '4LLbsb5ReP3yEtYzmXewyGjcir5uXtKFURtaEUVC2AHs',
     'CKaKtYvz6dKPyMvYq9Rh3UBrnNqYZAyd7iF4hJtjUvks',
-    'Taki7fi3Zicv7Du1xNAWLaf6mRK7ikdn77HeGzgwvo4',
+    'Taki7fi3Zicv7Du1xNAWLaf6mRK7ikdn77HeGzgwvo4', #Looks DEAD
     'hntyVP6YFm1Hg25TN9WGLqM12b8TQmcknKrdu1oxWux',
     '7ZCm8WBN9aLa3o47SoYctU6iLdj7wkGG5SV2hE5CgtD5',
     '7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs',
