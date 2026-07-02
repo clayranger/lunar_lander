@@ -125,8 +125,13 @@ class Investment(Base):
     amount = mapped_column(BigInteger)
     purchase_price_usdc = mapped_column(Float)
     sale_price_usdc = mapped_column(Float)
+    # cost_basis is purchase price plus + fees
+    # cost_basis_usdc
+    # (sale_price_usdc + fees) - (cost_basis)
+    # taxable_gain_or_loss =
     purchase_time_ms = mapped_column(BigInteger)
     sale_time_ms = mapped_column(BigInteger)
+    # buy_fee_native lamports = gas fee
     buy_fee_native_lamports = mapped_column(Integer)
     buy_fee_usdc = mapped_column(Float)
     sell_fee_native_lamports = mapped_column(Integer)
@@ -135,6 +140,7 @@ class Investment(Base):
     isClosed = mapped_column(Boolean, default=False)
     buy_tx_id = mapped_column(String)
     sell_tx_id = mapped_column(String)
+    priority_fee_lamports = mapped_column(BigInteger, default=0)
 
 
 class Security(Base):
@@ -151,12 +157,15 @@ class Security(Base):
     sell_fee_native_lamports = mapped_column(Integer)
     sell_fee_usdc = mapped_column(Float)
     revenue_at_sale_usdc = mapped_column(Float)
+
     isClosed = mapped_column(Boolean, default=False)
     buy_tx_id = mapped_column(String)
     sell_tx_id = mapped_column(String)
     isTax = mapped_column(Boolean, default=False)
     isSavings = mapped_column(Boolean, default=False)
     isGas = mapped_column(Boolean, default=False)
+    priority_fee_lamports = mapped_column(BigInteger, default=0)
+    # fees_taxable_gain_or_loss
 
 
 # Pydantic Schemas
@@ -343,54 +352,7 @@ def insert_investment(
         return Err(str(exc))   # No rollback here
 
 
-def record_partial_sell(
-    session: Session,
-    inv: Investment,
-    sold_lamports: int,
-    sell_tx_id: str,
-    sell_price_usdc: float = 0.0,
-    sell_fee_usdc: float = 0.0,
-) -> Result[bool]:
-    try:
-        if not inv:
-            return Err("Investment object is None")
-        if inv.isClosed:
-            return Err("Investment is already closed")
 
-        if sold_lamports <= 0 or sold_lamports > inv.amount:
-            return Err("Invalid sold amount")
-
-        remaining = inv.amount - sold_lamports
-
-        price = float(sell_price_usdc) if sell_price_usdc is not None else 0.0
-        fee = float(sell_fee_usdc) if sell_fee_usdc is not None else 0.0
-
-        inv.amount = sold_lamports
-        inv.isClosed = True
-        inv.sell_tx_id = sell_tx_id
-        inv.sale_time_ms = int(time.time() * 1000)
-        inv.sale_price_usdc = round(price, 6)
-        inv.sell_fee_usdc = round(fee, 6)
-        inv.revenue_at_sale_usdc = round(price - fee, 6)
-
-        if remaining > 0:
-            new_inv = Investment(
-                parent_id=inv.parent_id,
-                amount=remaining,
-                purchase_price_usdc=inv.purchase_price_usdc,
-                purchase_time_ms=inv.purchase_time_ms,
-                buy_fee_native_lamports=inv.buy_fee_native_lamports,
-                buy_fee_usdc=inv.buy_fee_usdc,
-                buy_tx_id=inv.buy_tx_id,
-                isClosed=False,
-            )
-            session.add(new_inv)
-
-        session.flush()
-        return Ok(True)
-
-    except Exception as e:
-        return Err(str(e))   # No rollback
 
 
 
@@ -436,28 +398,59 @@ def spend_gas_security(
     used_lamports: int,
     tx_id: str,
 ) -> Result[bool]:
-    """Reduce gas from a Security after using it for fees."""
+    """
+    Spend gas from a Security.
+    Splits the security and calculates capital gain/loss on the used portion.
+    """
     try:
         sec = session.execute(
             select(Security).where(Security.id == gas_security_id)
-        ).scalar_one()
+        ).scalar_one_or_none()
 
-        if sec.isClosed:
-            return Err("Gas security already closed")
+        if not sec or sec.isClosed:
+            return Err("Gas security not found or already closed")
 
         if used_lamports > sec.amount:
             return Err("Trying to spend more gas than available")
 
         remaining = sec.amount - used_lamports
-        sec.amount = max(0, remaining)
-        sec.isClosed = remaining <= 0
+
+        # Calculate profit/loss on the used portion
+        purchase_basis = sec.purchase_price_usdc or 0.0
+        # Rough current value of used gas (in USDC)
+        current_value = 0.0  # TODO: Use get_historical_price if we want extreme accuracy
+
+        revenue = current_value - purchase_basis * (used_lamports / sec.amount) if sec.amount > 0 else 0.0
+
+        # Close the used portion
+        sec.amount = used_lamports
+        sec.isClosed = True
         sec.sell_tx_id = tx_id
         sec.sale_time_ms = int(time.time() * 1000)
+        sec.sale_price_usdc = current_value
+        sec.revenue_at_sale_usdc = round(revenue, 6)
+        sec.priority_fee_lamports = 0
+
+        # Create remaining gas security if any
+        if remaining > 0:
+            new_gas = Security(
+                parent_id=sec.parent_id,
+                amount=remaining,
+                purchase_price_usdc=sec.purchase_price_usdc,
+                purchase_time_ms=sec.purchase_time_ms,
+                buy_fee_native_lamports=sec.buy_fee_native_lamports,
+                buy_fee_usdc=sec.buy_fee_usdc,
+                buy_tx_id=sec.buy_tx_id,
+                isClosed=False,
+                isGas=True,
+            )
+            session.add(new_gas)
 
         session.flush()
+        logging.info(f"[GAS] Spent {used_lamports} lamports from Security {gas_security_id} for tx {tx_id} | Revenue: ${revenue:.6f}")
         return Ok(True)
+
     except Exception as e:
-        session.rollback()
         return Err(str(e))
 
 
@@ -797,6 +790,14 @@ def execute_trade_with_gas(
     if sell_lamports <= 0 or sell_lamports > inv.amount:
         return Err("Invalid sell amount")
 
+    # === Gas requirement check ===
+    if estimated_gas_lamports > 0:
+        if gas_security_id is None:
+            return Err("gas_security_id is required when estimated_gas_lamports > 0. Please provide a valid gas Security ID.")
+        gas_check = ensure_sufficient_gas(session, estimated_gas_lamports, wallet_pk)
+        if gas_check.is_err():
+            return gas_check
+
     safety = pre_trade_safety_check(session, investment_id, sell_lamports, estimated_gas_lamports, wallet_pk)
     if safety.is_err():
         return safety
@@ -856,7 +857,7 @@ def execute_trade_with_gas(
     if not tx_sig:
         return Err("No confirmed transaction")
 
-    # === 3. Database recording with full error checking ===
+    # === 3. Database recording ===
     new_investment_id = None
     actual_usdc_received = 0.0
 
@@ -872,7 +873,6 @@ def execute_trade_with_gas(
             return buy_res
         new_investment_id = buy_res.ok_value
 
-        # Get actual USDC received if applicable
         if target_mint == WORLD_STABLE_COIN and new_investment_id:
             usdc_inv = session.execute(
                 select(Investment).where(Investment.id == new_investment_id)
@@ -880,7 +880,7 @@ def execute_trade_with_gas(
             if usdc_inv:
                 actual_usdc_received = float(usdc_inv.amount) / 1_000_000
 
-        # Record sell side
+        # Record sell side with proper price if selling into USDC
         sell_price_to_use = actual_usdc_received if target_mint == WORLD_STABLE_COIN else 0.0
 
         sell_res = record_partial_sell(
@@ -890,34 +890,38 @@ def execute_trade_with_gas(
             sell_tx_id=tx_sig,
             sell_price_usdc=sell_price_to_use,
             sell_fee_usdc=0.0,
+            priority_fee_lamports=priority_fee,   # ← Important for taxes
         )
         if sell_res.is_err():
+            logging.info("ERROR wit sell")
             return sell_res
 
-        # Gas
+        # Gas spending (now properly splits the security)
         if gas_security_id:
-            gas_res = spend_gas_security(session, gas_security_id, estimated_gas_lamports, tx_sig)
+            logging.info(f"[GAS] Attempting to spend {estimated_gas_lamports} from Security ID {gas_security_id}")
+            gas_res = spend_gas_security(
+                session=session,
+                gas_security_id=gas_security_id,
+                used_lamports=estimated_gas_lamports,
+                tx_id=tx_sig
+            )
+            logging.info(f"[GAS] Result: {gas_res}")
             if gas_res.is_err():
                 logging.warning(f"Gas spending failed: {gas_res.err_value}")
 
-        # Tax
-        tax_res = withhold_tax_on_profitable_sale(
+        withhold_tax_on_profitable_sale(
             session=session,
             investment_id=investment_id,
             sell_proceeds_usdc=sell_price_to_use,
             wallet_pk=wallet_pk,
         )
-        if tax_res.is_err():
-            logging.warning(f"Tax withholding failed: {tax_res.err_value}")
 
-        # Auto-merge USDC (non-fatal)
+        # Auto-merge (non-fatal)
         if target_mint == WORLD_STABLE_COIN:
             try:
                 merge_result = merge_usdc_investments(session=session, wallet_pk=wallet_pk)
-                if merge_result.is_err():
-                    logging.warning(f"Auto USDC merge failed: {merge_result.err_value}")
             except Exception as merge_e:
-                logging.warning(f"Auto USDC merge exception: {merge_e}")
+                logging.warning(f"Auto USDC merge failed: {merge_e}")
 
         session.commit()
 
@@ -1327,7 +1331,6 @@ def log_trade_result(
         logging.error(f"[TRADE] {log_entry}")
 
 
-
 def execute_sell_percentage_investment(
     session: Session,
     investment_id: int,
@@ -1335,6 +1338,7 @@ def execute_sell_percentage_investment(
     sell_percentage: float = 50.0,
     estimated_gas_lamports: int = 500_000,
     wallet_pk: int = None,
+    gas_security_id: Optional[int] = None,   # ← Added
     keypair_path: str = "~/.config/solana/mainnet-test.json",
     slippage_bps: int = 50,
 ) -> Result[dict]:
@@ -1380,14 +1384,10 @@ def execute_sell_percentage_investment(
         estimated_gas_lamports=estimated_gas_lamports,
         wallet_pk=wallet_pk,
         sell_lamports=sell_lamports,
+        gas_security_id=gas_security_id,   # ← Pass it through
         keypair_path=keypair_path,
         slippage_bps=slippage_bps,
     )
-
-
-
-
-
 
 
 def get_jupiter_quote(
@@ -2241,6 +2241,18 @@ def record_buy_side(
             if received_amount <= 0:
                 return Err(f"Could not determine received amount for {received_mint}")
 
+        # Historical price + decimals
+        if purchase_price_usdc <= 0.0:
+            price_res = get_historical_price(received_mint, int(time.time() * 1000))
+            if price_res.is_ok():
+                decimals = get_token_decimals(session, received_mint)
+                human_amount = received_amount / (10 ** decimals)
+                purchase_price_usdc = price_res.ok_value * human_amount
+
+        # For now, buy fees are usually very small or zero on Jupiter
+        buy_fee_native = 0
+        buy_fee_usdc = 0.0
+
         key_res = get_token_key(received_mint)
         if key_res.is_err():
             return key_res
@@ -2250,8 +2262,8 @@ def record_buy_side(
             amount=received_amount,
             purchase_price_usdc=round(purchase_price_usdc, 6),
             purchase_time_ms=int(time.time() * 1000),
-            buy_fee_native_lamports=0,
-            buy_fee_usdc=0.0,
+            buy_fee_native_lamports=buy_fee_native,
+            buy_fee_usdc=buy_fee_usdc,
             buy_tx_id=tx_signature,
         )
 
@@ -2266,7 +2278,7 @@ def record_buy_side(
             return result
 
         new_investment_id = result.ok_value
-        logging.info(f"[BUY] Created Investment {new_investment_id} for {received_mint[:12]}...")
+        logging.info(f"[BUY] Created Investment {new_investment_id} | Cost: ${purchase_price_usdc:.6f} | Buy Fee: {buy_fee_native} lam")
 
         return Ok(new_investment_id)
 
@@ -2328,3 +2340,172 @@ def merge_usdc_investments(
 
     except Exception as e:
         return Err(f"Merge USDC failed: {str(e)}")
+
+
+def record_partial_sell(
+    session: Session,
+    inv: Investment,
+    sold_lamports: int,
+    sell_tx_id: str,
+    sell_price_usdc: float = 0.0,
+    sell_fee_usdc: float = 0.0,
+    priority_fee_lamports: int = 0,
+) -> Result[bool]:
+    """
+    Records a partial or full sale of an Investment.
+    Correct profit calculation for taxes.
+    """
+    try:
+        if not inv:
+            return Err("Investment object is None")
+        if inv.isClosed:
+            return Err("Investment is already closed")
+
+        if sold_lamports <= 0 or sold_lamports > inv.amount:
+            return Err("Invalid sold amount")
+
+        remaining = inv.amount - sold_lamports
+
+        price = float(sell_price_usdc) if sell_price_usdc is not None else 0.0
+        fee = float(sell_fee_usdc) if sell_fee_usdc is not None else 0.0
+
+        # Update the sold portion
+        inv.amount = sold_lamports
+        inv.isClosed = True
+        inv.sell_tx_id = sell_tx_id
+        inv.sale_time_ms = int(time.time() * 1000)
+        inv.sale_price_usdc = round(price, 6)
+        inv.sell_fee_usdc = round(fee, 6)
+        inv.priority_fee_lamports = priority_fee_lamports
+
+        # Revenue = profit on the sold portion (sale price - purchase price)
+        purchase_basis = inv.purchase_price_usdc or 0.0
+        profit = price - purchase_basis
+        inv.revenue_at_sale_usdc = round(profit - fee, 6)
+
+        # Create new remaining Investment if needed
+        if remaining > 0:
+            new_inv = Investment(
+                parent_id=inv.parent_id,
+                amount=remaining,
+                purchase_price_usdc=inv.purchase_price_usdc,
+                purchase_time_ms=inv.purchase_time_ms,
+                buy_fee_native_lamports=inv.buy_fee_native_lamports,
+                buy_fee_usdc=inv.buy_fee_usdc,
+                buy_tx_id=inv.buy_tx_id,
+                isClosed=False,
+            )
+            session.add(new_inv)
+
+        session.flush()
+        return Ok(True)
+
+    except Exception as e:
+        return Err(str(e))
+
+
+def get_historical_price(
+    mint: str,
+    timestamp_ms: int,
+    fallback_to_current: bool = True
+) -> Result[float]:
+    """
+    Gets approximate USD price of a token at a specific time using Birdeye.
+    """
+    logging.info(f"[PRICE] Looking up price for {mint} at {timestamp_ms}")
+
+    birdeye_key = os.getenv("BIRDEYE_API_KEY")
+
+    if birdeye_key:
+        try:
+            url = "https://public-api.birdeye.so/defi/history_price"
+            params = {
+                "address": mint,
+                "address_type": "token",
+                "type": "1m",
+                "time_from": int(timestamp_ms / 1000) - 3600,
+                "time_to": int(timestamp_ms / 1000),
+                "ui_amount_mode": "raw"
+            }
+            headers = {"X-API-KEY": birdeye_key}
+
+            resp = requests.get(url, params=params, headers=headers, timeout=15)
+
+            if resp.status_code == 200:
+                data = resp.json()
+                price_items = data.get("data", {}).get("items", [])
+
+                if price_items:
+                    # Find closest price to our timestamp
+                    closest = min(price_items, key=lambda x: abs(x.get("unixTime", 0) * 1000 - timestamp_ms))
+                    price = float(closest.get("value", 0))
+                    if price > 0:
+                        logging.info(f"[PRICE] Found historical price: ${price:.6f}")
+                        return Ok(price)
+        except Exception as e:
+            logging.warning(f"[BIRDEYE] Failed: {e}")
+
+    # Fallback
+    if fallback_to_current:
+        current_res = get_current_price(mint)
+        if current_res.is_ok():
+            logging.warning(f"[PRICE] Using current price as fallback for {mint}")
+            return current_res
+
+    return Err("Could not fetch historical or current price")
+
+
+def get_current_price(mint: str) -> Result[float]:
+    """Fallback current price using Jupiter."""
+    try:
+        url = f"https://price.jup.ag/v6/price?ids={mint}"
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        price = data.get("data", {}).get(mint, {}).get("price")
+        if price:
+            return Ok(float(price))
+        return Err("No price returned from Jupiter")
+    except Exception as e:
+        return Err(str(e))
+
+
+def get_token_decimals(session: Session, mint: str) -> int:
+    """
+    Get token decimals from database first, then Jupiter API as fallback.
+    """
+    # 1. Try database first
+    try:
+        key_res = get_token_key(mint)
+        if key_res.is_ok():
+            token = session.execute(
+                select(Token).where(Token.id == key_res.ok_value.tobytes())
+            ).scalar_one_or_none()
+            if token and token.decimals:
+                return token.decimals
+    except:
+        pass
+
+    # 2. Fallback to Jupiter
+    try:
+        url = f"https://api.jup.ag/price/v3/ids={mint}"
+        headers = {}
+        jup_key = os.getenv("JUPITER_API_KEY")
+        if jup_key:
+            headers["x-api-key"] = jup_key
+
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        decimals = data.get(mint, {}).get("decimals")
+        if decimals is not None:
+            return int(decimals)
+    except Exception as e:
+        logging.warning(f"[DECIMALS] Jupiter fallback failed for {mint}: {e}")
+
+    return 9
+
+
+
+
