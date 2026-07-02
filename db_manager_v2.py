@@ -862,12 +862,15 @@ def execute_trade_with_gas(
     actual_usdc_received = 0.0
 
     try:
+        # Gas spending (include both estimated gas + priority fee)
+        total_gas_used = estimated_gas_lamports + priority_fee
         # Record buy side
         buy_res = record_buy_side(
             session=session,
             wallet_pk=wallet_pk,
             received_mint=target_mint,
-            tx_signature=tx_sig
+            tx_signature=tx_sig,
+            buy_fee_native_lamports=total_gas_used,   # ← Pass total gas used
         )
         if buy_res.is_err():
             return buy_res
@@ -896,16 +899,16 @@ def execute_trade_with_gas(
             logging.info("ERROR wit sell")
             return sell_res
 
-        # Gas spending (now properly splits the security)
+
+
         if gas_security_id:
-            logging.info(f"[GAS] Attempting to spend {estimated_gas_lamports} from Security ID {gas_security_id}")
+            logging.info(f"[GAS] Attempting to spend {total_gas_used} (gas + priority) from Security ID {gas_security_id}")
             gas_res = spend_gas_security(
                 session=session,
                 gas_security_id=gas_security_id,
-                used_lamports=estimated_gas_lamports,
+                used_lamports=total_gas_used,
                 tx_id=tx_sig
             )
-            logging.info(f"[GAS] Result: {gas_res}")
             if gas_res.is_err():
                 logging.warning(f"Gas spending failed: {gas_res.err_value}")
 
@@ -2228,6 +2231,7 @@ def record_buy_side(
     tx_signature: str,
     received_amount: int = None,
     purchase_price_usdc: float = 0.0,
+    buy_fee_native_lamports: int = 0,   # ← New parameter
 ) -> Result[int]:
     try:
         if received_amount is None or received_amount <= 0:
@@ -2262,8 +2266,8 @@ def record_buy_side(
             amount=received_amount,
             purchase_price_usdc=round(purchase_price_usdc, 6),
             purchase_time_ms=int(time.time() * 1000),
-            buy_fee_native_lamports=buy_fee_native,
-            buy_fee_usdc=buy_fee_usdc,
+            buy_fee_native_lamports=buy_fee_native_lamports,   # ← Use the passed value
+            buy_fee_usdc=0.0,
             buy_tx_id=tx_signature,
         )
 
@@ -2278,8 +2282,7 @@ def record_buy_side(
             return result
 
         new_investment_id = result.ok_value
-        logging.info(f"[BUY] Created Investment {new_investment_id} | Cost: ${purchase_price_usdc:.6f} | Buy Fee: {buy_fee_native} lam")
-
+        logging.info(f"[BUY] Created Investment {new_investment_id} | Cost: ${purchase_price_usdc:.6f} | Buy Fee: {buy_fee_native_lamports} lam")
         return Ok(new_investment_id)
 
     except Exception as e:
