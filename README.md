@@ -1,16 +1,13 @@
-# Lunar Lander DeFi API
+# Lunar Lander DeFi Backend API
 
 DeFi transaction handler + immutable tax records for compliance.
 
 ## Features
-- Connect to multiple chains (Ethereum, Base, etc.)
-- Execute swaps, transfers, liquidity ops
-- Automatic tax logging (cost basis, gains/losses)
-- REST API + webhooks
+- Trade on Jup 
+- Automatic tax withholding 
+- Interacts with SaturnV trade bot.
 
 ## Setup
 ```bash
-npm install
-cp .env.example .env
-npm run dev
+echo "Hello World"
 ```
