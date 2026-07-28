@@ -10,35 +10,39 @@ app.use('*', cors());
 app.route('/api/auth', auth);
 app.route('/api/trades', trades);
 
-// WebSocket endpoint for real‑time price updates (simulated)
-app.get('/ws', (c) => {
-  const upgrade = c.req.header('Upgrade');
-  if (upgrade === 'websocket') {
-    return Bun.upgrade(c.req.raw, {
-      // You can pass custom data to the WebSocket handler
-    });
-  }
-  return c.text('WebSocket upgrade required', 426);
-});
+app.get('/ws', (c) => c.text('WebSocket upgrade required', 426));
 
-// WebSocket handler (Bun's native)
+
+
 Bun.serve({
-  fetch: app.fetch,
+  port: 3001,
+  fetch(req, server) {
+    const url = new URL(req.url);
+
+    // Handle WebSocket upgrade on /ws
+    if (url.pathname === '/ws') {
+      const success = server.upgrade(req);
+      if (success) {
+        return; // important: do NOT return a Response
+      }
+      return new Response('WebSocket upgrade failed', { status: 400 });
+    }
+
+    // Everything else goes through Hono
+    return app.fetch(req);
+  },
   websocket: {
     open(ws) {
       console.log('WebSocket opened');
-      // Start sending simulated price updates
       const interval = setInterval(() => {
         const price = 50000 + Math.random() * 1000;
         ws.send(JSON.stringify({ type: 'price', symbol: 'BTC/USD', price }));
       }, 1000);
 
       ws.send(JSON.stringify({ type: 'connected' }));
-      // Store interval to clear on close
       (ws as any).interval = interval;
     },
     message(ws, message) {
-      // Handle incoming messages (e.g., subscribe to specific symbols)
       console.log('Received:', message);
     },
     close(ws) {
@@ -46,7 +50,6 @@ Bun.serve({
       console.log('WebSocket closed');
     },
   },
-  port: 3001,
 });
 
 console.log('Backend running on http://localhost:3001');
