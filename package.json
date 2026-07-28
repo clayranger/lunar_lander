@@ -1,22 +1,20 @@
 {
-  "name": "lunar-lander-defi-api",
-  "version": "0.1.0",
-  "description": "DeFi crypto transactions API with tax record storage",
-  "main": "src/index.js",
-  "scripts": {
-    "start": "node src/index.js",
-    "dev": "nodemon src/index.js",
-    "test": "jest"
+  "name": "lunar_lander",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bcryptjs": "^3.0.0",
+    "@types/bun": "latest",
+    "@types/jsonwebtoken": "^9.0.10"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "ethers": "^6.13.0",
-    "dotenv": "^16.3.1",
-    "winston": "^3.10.0",
-    "sqlite3": "^5.1.6"
-  },
-  "devDependencies": {
-    "jest": "^29.7.0",
-    "nodemon": "^3.0.1"
+    "@hono/zod-validator": "^0.9.0",
+    "bcryptjs": "^3.0.3",
+    "hono": "^4.12.32",
+    "jsonwebtoken": "^9.0.3"
   }
 }
