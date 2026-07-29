@@ -15,7 +15,7 @@ db.run(`
     gas_level_choice REAL DEFAULT 0.05,
     tax_level_choice REAL DEFAULT 0.30,
     savings_level_choice REAL DEFAULT 0.10,
-    autopilot_on INTEGER DEFAULT 0,
+    autopilot_on INTEGER DEFAULT 0, -- OFF, 1 AUTOPILOT, 2 AUTOTHROTTLE
     created_at_ms INTEGER,
     updated_at_ms INTEGER
   )
@@ -153,7 +153,8 @@ db.run(`
     buy_tx_id TEXT,
     sell_tx_id TEXT,
     is_closed INTEGER DEFAULT 0,
-    position_type INTEGER NOT NULL CHECK (position_type BETWEEN 0 AND 4),
+    is_in_transit INTEGER DEFAULT 0,
+    position_type INTEGER NOT NULL CHECK (position_type BETWEEN 0 AND 5), -- not settled: 5
     FOREIGN KEY (wallet_token_id) REFERENCES wallet_token_table(id) ON DELETE CASCADE
   )
 `);
