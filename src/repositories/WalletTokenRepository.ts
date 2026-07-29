@@ -1,7 +1,7 @@
 // repositories/WalletTokenRepository.ts
 import { db } from '../db';
-import { Ok, Err, Result } from '../types/result';
 import { WalletTokenDTO } from '../types/dtos';
+import { RecordNotFoundException } from '../errors/databaseErrors';
 
 export class WalletTokenRepository {
     // Ensure a (walletId, tokenMint) mapping exists; create if missing.
@@ -11,42 +11,36 @@ export class WalletTokenRepository {
         isNative: boolean = false,
         isOfficialStable: boolean = false,
         isAltStable: boolean = false
-    ): Result<WalletTokenDTO, string> {
-        try {
-            const existing = db
-            .query('SELECT * FROM wallet_token_table WHERE wallet_id = ? AND token_mint = ?')
-            .get(walletId, tokenMint) as any;
-            if (existing) {
-                return Ok(this.mapRowToDTO(existing));
-            }
-
-            // Verify token exists in token_table (foreign key will catch, but we check)
-            const tokenExists = db.query('SELECT 1 FROM token_table WHERE mint = ?').get(tokenMint);
-            if (!tokenExists) {
-                return Err(`Cannot link WalletToken: Token mint '${tokenMint}' does not exist in token_table.`);
-            }
-
-            const nowMs = Date.now();
-            const insert = db.run(
-                `INSERT INTO wallet_token_table (
-                    wallet_id, token_mint, audited_amount_lamports, audited_time_ms,
-                    ata_exists, rent_paid, is_native, is_official_stable, is_alt_stable
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                                  walletId, tokenMint, 0, nowMs,
-                                  0, 0,
-                                  isNative ? 1 : 0,
-                                  isOfficialStable ? 1 : 0,
-                                  isAltStable ? 1 : 0
-            );
-            const id = insert.lastInsertRowid as number;
-            const row = db.query('SELECT * FROM wallet_token_table WHERE id = ?').get(id);
-            return Ok(this.mapRowToDTO(row));
-        } catch (e: any) {
-            return Err(`Database error securing wallet token: ${e.message}`);
+    ): WalletTokenDTO {
+        const existing = db
+        .query('SELECT * FROM wallet_token_table WHERE wallet_id = ? AND token_mint = ?')
+        .get(walletId, tokenMint) as any;
+        if (existing) {
+            return this.mapRowToDTO(existing);
         }
-    }
 
-    // Additional methods used by PositionRepository (like findAllByWallet) can be added if needed.
+        // Verify token exists in token_table
+        const tokenExists = db.query('SELECT 1 FROM token_table WHERE mint = ?').get(tokenMint);
+        if (!tokenExists) {
+            throw new RecordNotFoundException('Token', tokenMint);
+        }
+
+        const nowMs = Date.now();
+        const insert = db.run(
+            `INSERT INTO wallet_token_table (
+                wallet_id, token_mint, audited_amount_lamports, audited_time_ms,
+                ata_exists, rent_paid, is_native, is_official_stable, is_alt_stable
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                              walletId, tokenMint, 0, nowMs,
+                              0, 0,
+                              isNative ? 1 : 0,
+                              isOfficialStable ? 1 : 0,
+                              isAltStable ? 1 : 0
+        );
+        const id = insert.lastInsertRowid as number;
+        const row = db.query('SELECT * FROM wallet_token_table WHERE id = ?').get(id);
+        return this.mapRowToDTO(row);
+    }
 
     private mapRowToDTO(row: any): WalletTokenDTO {
         return {

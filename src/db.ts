@@ -76,7 +76,7 @@ db.run(`
 `);
 // Index on wallet_table.user_id (matching Kotlin index)
 db.run(`
-  CREATE INDEX idx_wallet_user ON wallet_table(user_id);
+  CREATE INDEX IF NOT EXISTS idx_wallet_user ON wallet_table(user_id);
 `);
 // 4. WalletTokens (references wallets and tokens)
 db.run(`
@@ -102,10 +102,10 @@ db.run(`
 
 // Indexes
 db.run(`
-  CREATE INDEX idx_wallet_token_wallet ON wallet_token_table(wallet_id)
+  CREATE INDEX IF NOT EXISTS idx_wallet_token_wallet ON wallet_token_table(wallet_id)
 `);
 db.run(`
-  CREATE INDEX idx_wallet_token_mint ON wallet_token_table(token_mint)
+  CREATE INDEX IF NOT EXISTS idx_wallet_token_mint ON wallet_token_table(token_mint)
 `);
 
 // 5. UserTokenSettings (references users and tokens)
@@ -129,10 +129,10 @@ db.run(`
 
 // Indexes
 db.run(`
-  CREATE INDEX idx_settings_user ON user_token_settings(user_id)
+  CREATE INDEX IF NOT EXISTS idx_settings_user ON user_token_settings(user_id)
 `);
 db.run(`
-  CREATE INDEX idx_settings_token ON user_token_settings(token_mint);
+  CREATE INDEX IF NOT EXISTS idx_settings_token ON user_token_settings(token_mint);
 `);
 // 6. Positions (references wallet_token_table)
 db.run(`
@@ -161,10 +161,10 @@ db.run(`
 
 // Indexes (matching Kotlin)
 db.run(`
-CREATE INDEX idx_position_token ON position_table(wallet_token_id)
+CREATE INDEX IF NOT EXISTS idx_position_token ON position_table(wallet_token_id)
 `);
 db.run(`
-CREATE INDEX idx_security_open ON position_table(is_closed)
+CREATE INDEX IF NOT EXISTS idx_security_open ON position_table(is_closed)
 `);
 
 // 7. ErrorLogs (no foreign keys in Kotlin, but we can add a FK to wallet if desired)
