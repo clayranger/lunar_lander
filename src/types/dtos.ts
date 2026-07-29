@@ -10,6 +10,8 @@ export interface TokenDTO {
     priceTracking: boolean;
     stableCoinOfficial: boolean;
     stableCoinAlt: boolean;
+    isSelected: boolean;
+    selectedAtMs: number | null;
     createdAtMs: number | null;
     updatedAtMs: number | null;
 }

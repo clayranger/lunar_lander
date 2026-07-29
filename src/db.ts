@@ -52,10 +52,24 @@ db.run(`
     price_tracking INTEGER DEFAULT 1,  -- boolean
     stable_coin_official INTEGER DEFAULT 0,
     stable_coin_alt INTEGER DEFAULT 0,
+    is_selected INTEGER DEFAULT 0,
+    selected_at_ms INTEGER,
     created_at_ms INTEGER,
     updated_at_ms INTEGER
   )
 `);
+
+// Migrations for existing DBs (CREATE TABLE IF NOT EXISTS does not add new columns)
+try {
+  db.run('ALTER TABLE token_table ADD COLUMN is_selected INTEGER DEFAULT 0');
+} catch {
+  // column already exists
+}
+try {
+  db.run('ALTER TABLE token_table ADD COLUMN selected_at_ms INTEGER');
+} catch {
+  // column already exists
+}
 
 // 3. Wallets (references users)
 db.run(`
