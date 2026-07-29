@@ -2,6 +2,9 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import auth from './routes/auth';
 import trades from './routes/trades';
+import { tokenSelector } from './services/tokenSelector';
+import { TradeBotEngine } from './tradeBot/engine.ts'
+tokenSelector.startAutoRefresh(280);
 
 const app = new Hono();
 
@@ -12,6 +15,9 @@ app.route('/api/trades', trades);
 
 app.get('/ws', (c) => c.text('WebSocket upgrade required', 426));
 
+tokenSelector.startAutoRefresh(290);
+const robot = new TradeBotEngine();
+robot.start();
 
 
 Bun.serve({

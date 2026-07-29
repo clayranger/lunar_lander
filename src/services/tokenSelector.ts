@@ -89,8 +89,9 @@ export class TokenSelector {
     }
 
     /** Poll refresh() on a fixed interval. Safe to call once at startup. */
-    startAutoRefresh(intervalMs: number): void {
+    startAutoRefresh(intervalMinutes: number): void {
         this.stopAutoRefresh();
+        const intervalMs = intervalMinutes * 60_000;
         this.autoRefreshHandle = setInterval(() => {
             void this.refresh().catch(err => {
                 console.error('[TokenSelector] auto-refresh failed:', err);
