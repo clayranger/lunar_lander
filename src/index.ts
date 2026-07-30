@@ -16,6 +16,7 @@ app.route('/api/trades', trades);
 app.get('/ws', (c) => c.text('WebSocket upgrade required', 426));
 
 tokenSelector.startAutoRefresh(290);
+tokenSelector.refresh();
 const robot = new TradeBotEngine();
 robot.start();
 
