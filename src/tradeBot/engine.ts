@@ -48,7 +48,19 @@ export class TradeBotEngine {
 
     public start(): void {
         try {
+            // The price engine needs to be started before it gets tokens 
+            // The geyser is happy getting tokens before hadn
+            // maybe look into that i dunno.
             // Strict initialization check before starting Geyser pipeline
+            // Lets try pulling the jup api key from the .env -> we will need to get
+            //  this to zig.
+            console.log("this be the api key");
+            console.log(Bun.env.JUPITER_API_KEY);
+            const apiKey = Bun.env.JUPITER_API_KEY;
+            if (!apiKey) {
+              throw new Error("Jup key MISSING!!!!");
+            }
+            this.f1.startPriceEngine(apiKey, 3);
             this.syncSelectedTokens();
             
             // Start Geyser plugin / WebSocket stream only if token registration succeeded
