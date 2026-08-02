@@ -54,12 +54,25 @@ export class TradeBotEngine {
             // Strict initialization check before starting Geyser pipeline
             // Lets try pulling the jup api key from the .env -> we will need to get
             //  this to zig.
-            console.log("this be the api key");
-            console.log(Bun.env.JUPITER_API_KEY);
+            console.log("Loading API Key");
+            // console.log(Bun.env.JUPITER_API_KEY);
             const apiKey = Bun.env.JUPITER_API_KEY;
             if (!apiKey) {
               throw new Error("Jup key MISSING!!!!");
             }
+            const walletKey = Bun.env.WALLET_PUBLIC_KEY;
+            if (!walletKey) {
+              throw new Error("Wallet key MISSING!!!!");
+            }
+            const questHost = Bun.env.QUESTDB_HOST;
+            if (!questHost) {
+              throw new Error("Quest host MISSING!!!!");
+            }
+            const questPort = Bun.env.QUESTDB_PORT;
+            if (!questPort) {
+              throw new Error("Quest port MISSING!!!!");
+            }
+
             this.f1.startPriceEngine(apiKey, 3);
             this.syncSelectedTokens();
             
