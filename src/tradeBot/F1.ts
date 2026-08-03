@@ -28,11 +28,23 @@ export class F1 {
             removeToken:      { args: [FFIType.ptr], returns: FFIType.bool },
             startPriceEngine: { args: [FFIType.ptr, FFIType.u64], returns: FFIType.bool },
             stopPriceEngine:  { args: [], returns: FFIType.void },
+            initQuestDB:      { args: [FFIType.ptr, FFIType.u16], returns: FFIType.u8 },
         });
 
         // 2. Pass the callback pointer to native code
         this.engine.symbols.initZigPipeline(onResult.ptr);
         this.engine.symbols.startEngine();
+    }
+
+    public initQuestDB(q_url: string, port: bigint | number ): boolean {
+        // Convert string to a null-terminated C-string buffer
+          const keyBuf = Buffer.from(`${q_url}\0`, "utf8");
+          return Boolean(
+            this.engine.symbols.initQuestDB(
+              ptr(keyBuf),
+              BigInt(port)
+            )
+          );
     }
 
     public startGeyser() {

@@ -72,7 +72,7 @@ export class TradeBotEngine {
             if (!questPort) {
               throw new Error("Quest port MISSING!!!!");
             }
-
+            this.f1.initQuestDB(questHost, +questPort);
             this.f1.startPriceEngine(apiKey, 3);
             this.syncSelectedTokens();
             
