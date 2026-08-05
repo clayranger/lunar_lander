@@ -21,9 +21,24 @@ defmodule LunarLander.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      # {:dep_from_hexpm, "~> 0.3.0"},
-      # {:dep_from_git, git: "https://github.com/elixir-lang/my_dep.git", tag: "0.1.0"}
-       {:zigler, "~> 0.15"}
+      # HTTP client (ProcessingPool already uses Req)
+      {:req, "~> 0.5"},
+
+      # Database
+      {:ecto_sql, "~> 3.12"},
+      {:postgrex, ">= 0.0.0"},          # change if you use a different adapter
+
+      # Zig NIF bridge for the F1 engine
+      {:zigler, "~> 0.15"},
+
+      # Solana mint (base58) decoding — used in TradeBotEngine
+      {:base58, "~> 0.1"},              # or {:base58_ex, "~> 0.1"} if you prefer
+
+      # JSON (Req uses it; useful for APIs later)
+      {:jason, "~> 1.4"},
+
+      # Optional but recommended
+      {:dotenvy, "~> 0.8"}              # nice for loading .env in dev
     ]
   end
 end
