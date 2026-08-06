@@ -1,12 +1,15 @@
 defmodule Robot.F1 do
   use Zig,
-    otp_app: :my_app,
-    libs: ["lib/libF-1-Engine.so"],
-    c_includes: ["engine_api.h"] # Header defining your exported C API
+    otp_app: :lunar_lander,
+    c: [
+      include_dirs: ["include"],
+      library_dirs: ["lib"],
+      link_lib: ["F-1-Engine"]
+    ]
 
   ~Z"""
   const c = @cImport({
-      @cInclude("engine_api.h");
+      @cInclude("f1_engine.h");
   });
 
   // Elixir binaries map cleanly to Zig []const u8 slices
