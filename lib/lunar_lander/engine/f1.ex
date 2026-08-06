@@ -1,10 +1,12 @@
-defmodule Robot.F1 do
+defmodule LunarLander.Engine.F1 do
+  # Resolve path absolute to this file's directory at compile-time
+  @engine_dir Path.dirname(__ENV__.file)
   use Zig,
     otp_app: :lunar_lander,
     c: [
-      include_dirs: ["include"],
-      library_dirs: ["lib"],
-      link_lib: ["F-1-Engine"]
+      include_dirs: [Path.join(@engine_dir, "../../../include")],
+      library_dirs: [Path.join(@engine_dir, "../../../lib")],
+      link_lib: ["libF-1-Engine.so"]
     ]
 
   ~Z"""

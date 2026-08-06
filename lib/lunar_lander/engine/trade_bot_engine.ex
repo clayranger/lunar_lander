@@ -1,6 +1,6 @@
-defmodule Robot.TradeBotEngine do
-  alias Robot.F1
-  alias Robot.TokenRepository # Assuming your Ecto/DB repo
+defmodule LunarLander.Engine.TradeBotEngine do
+  alias LunarLander.Engine.F1
+  alias LunarLander.TokenRepository # Assuming your Ecto/DB repo
 
   @doc """
   Loads all selected tokens from the DB and adds them to the native F1 engine.

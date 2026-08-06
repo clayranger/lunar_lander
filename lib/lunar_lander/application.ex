@@ -1,16 +1,16 @@
 # lib/trading/application.ex
-defmodule Trading.Application do
+defmodule LunarLander.Application do
   use Application
 
   @impl true
   def start(_type, _args) do
     children = [
-      Trading.Repo,
-      Trading.Services.ProcessingPool,
-      {Trading.Services.TokenSelector, interval_minutes: 5}
+      LunarLander.Repo,
+      LunarLander.Services.ProcessingPool,
+      {LunarLander.Services.TokenSelector, interval_minutes: 5}
       # Trading.Services.RateLimiter, ...
     ]
-
-    Supervisor.start_link(children, strategy: :one_for_one, name: Trading.Supervisor)
+    IO.puts("Hello World")
+    Supervisor.start_link(children, strategy: :one_for_one, name: LunarLander.Supervisor)
   end
 end

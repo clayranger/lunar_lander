@@ -1,5 +1,4 @@
-# lib/trading/services/rate_limiter.ex
-defmodule Trading.Services.RateLimiter do
+defmodule LunarLander.Services.RateLimiter do
   @moduledoc """
   Priority token bucket rate limiter.
 

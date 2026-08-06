@@ -1,5 +1,4 @@
-# lib/trading/services/processing_pool.ex
-defmodule Trading.Services.ProcessingPool do
+defmodule LunarLander.Services.ProcessingPool do
   use GenServer
   require Logger
 

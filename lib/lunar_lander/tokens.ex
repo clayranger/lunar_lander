@@ -1,8 +1,7 @@
-# lib/trading/tokens.ex
-defmodule Trading.Tokens do
+defmodule LunarLander.Schemas.Tokens do
   import Ecto.Query
-  alias Trading.Repo
-  alias Trading.Schemas.Token
+  alias LunarLander.Repo
+  alias LunarLander.Schemas.Token
 
   def find_by_mint(mint), do: Repo.get_by(Token, mint: mint)
 

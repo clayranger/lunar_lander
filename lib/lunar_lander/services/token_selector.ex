@@ -1,8 +1,8 @@
-# lib/trading/services/token_selector.ex
-defmodule Trading.Services.TokenSelector do
+defmodule LunarLander.Services.TokenSelector do
   use GenServer
   require Logger
-  alias Trading.{Tokens, Services.ProcessingPool}
+  # To be honest im not sure about this line.
+  alias LunarLander.Services.{Tokens, Services.ProcessingPool}
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   def refresh, do: GenServer.call(__MODULE__, :refresh, 15_000)
@@ -27,11 +27,15 @@ defmodule Trading.Services.TokenSelector do
   def handle_call(:refresh, _from, state) do
     {:reply, do_refresh(), state}
   end
-
-  defp do_refresh do
+defp do_refresh do
     case ProcessingPool.refresh() do
-      {:error, reason} when ProcessingPool.get_pool() == [] -> raise reason
-      _ -> :ok
+      {:error, reason} ->
+        if ProcessingPool.get_pool() == [] do
+          raise reason
+        end
+
+      _ ->
+        :ok
     end
 
     pool = ProcessingPool.get_pool()

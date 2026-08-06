@@ -1,4 +1,4 @@
-defmodule TradeAuditor do
+defmodule LunarLander.Services.TradeAuditor do
   use GenServer
   require Logger
 

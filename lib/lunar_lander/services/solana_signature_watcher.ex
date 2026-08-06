@@ -1,4 +1,4 @@
-defmodule SolanaSignatureWatcher do
+defmodule LunarLander.Services.SolanaSignatureWatcher do
   @moduledoc """
   Subscribes to Chainstack Solana WebSocket events for 31-block finality (`signatureSubscribe`).
   """

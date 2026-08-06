@@ -1,5 +1,4 @@
-# lib/trading/schemas/token.ex
-defmodule Trading.Schemas.Token do
+defmodule LunarLander.Schemas.Token do
   use Ecto.Schema
   import Ecto.Changeset
 
@@ -17,6 +16,14 @@ defmodule Trading.Schemas.Token do
     field :selected_at_ms, :integer
     field :created_at_ms, :integer
     field :updated_at_ms, :integer
+
+    has_many :wallet_tokens, LunarLander.Schemas.WalletToken,
+      foreign_key: :token_mint,
+      references: :mint
+
+    has_many :user_token_settings, LunarLander.Schemas.UserTokenSetting,
+      foreign_key: :token_mint,
+      references: :mint
   end
 
   def changeset(token, attrs) do

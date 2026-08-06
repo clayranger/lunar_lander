@@ -14,7 +14,8 @@ defmodule LunarLander.MixProject do
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
-      extra_applications: [:logger]
+      extra_applications: [:logger],
+      mod: {LunarLander.Application, []}
     ]
   end
 
@@ -38,7 +39,9 @@ defmodule LunarLander.MixProject do
       {:jason, "~> 1.4"},
 
       # Optional but recommended
-      {:dotenvy, "~> 0.8"}              # nice for loading .env in dev
+      {:dotenvy, "~> 0.8"},              # nice for loading .env in dev
+
+      {:websockex, "~> 0.5.1"}
     ]
   end
 end

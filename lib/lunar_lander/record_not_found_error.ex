@@ -1,5 +1,4 @@
-# lib/trading/record_not_found_error.ex
-defmodule Trading.RecordNotFoundError do
+defmodule LunarLander.RecordNotFoundError do
   defexception [:entity, :id]
 
   @impl true

@@ -1,8 +1,7 @@
-# lib/trading/wallet_tokens.ex
-defmodule Trading.WalletTokens do
-  alias Trading.Repo
-  alias Trading.Schemas.WalletToken
-  alias Trading.Tokens
+defmodule LunarLander.Schema.WalletTokens do
+  alias LunarLander.Repo
+  alias LunarLander.Schemas.WalletToken
+  alias LunarLander.Tokens
 
   def ensure_exists(wallet_id, token_mint, opts \\ []) do
     case Repo.get_by(WalletToken, wallet_id: wallet_id, token_mint: token_mint) do

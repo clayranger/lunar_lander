@@ -1,11 +1,10 @@
-# lib/trading/services/rate_limited_fetch.ex
-defmodule Trading.Services.RateLimitedFetch do
+defmodule LunarLander.Services.RateLimitedFetch do
   @moduledoc """
   Wraps Req with priority-bucket acquisition, retry-after-aware 429
   handling, and exponential backoff on transport errors — mirrors
   rateLimitedFetch() in the JS version.
   """
-  alias Trading.Services.RateLimiter
+  alias LunarLander.Services.RateLimiter
 
   @default_max_retries 3
 
